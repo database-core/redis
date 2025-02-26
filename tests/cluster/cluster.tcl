@@ -1,18 +1,11 @@
 # Cluster-specific test functions.
 #
-# Copyright (C) 2014-Present, Redis Ltd.
-# All Rights reserved.
-#
-# Licensed under your choice of the Redis Source Available License 2.0
-# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+# Copyright (C) 2014 Salvatore Sanfilippo antirez@gmail.com
+# This software is released under the BSD License. See the COPYING file for
+# more information.
 
-# Track cluster configuration as created by create_cluster below
-set ::cluster_master_nodes 0
-set ::cluster_replica_nodes 0
-
-# Returns a parsed CLUSTER NODES output as a list of dictionaries. Optional status field
-# can be specified to only returns entries that match the provided status.
-proc get_cluster_nodes {id {status "*"}} {
+# Returns a parsed CLUSTER NODES output as a list of dictionaries.
+proc get_cluster_nodes id {
     set lines [split [R $id cluster nodes] "\r\n"]
     set nodes {}
     foreach l $lines {
@@ -30,9 +23,7 @@ proc get_cluster_nodes {id {status "*"}} {
             linkstate [lindex $args 7] \
             slots [lrange $args 8 end] \
         ]
-        if {[string match $status [lindex $args 7]]} {
-            lappend nodes $node
-        }
+        lappend nodes $node
     }
     return $nodes
 }
@@ -71,7 +62,7 @@ proc s {n field} {
     get_info_field [R $n info] $field
 }
 
-# Assuming nodes are reset, this function performs slots allocation.
+# Assuming nodes are reest, this function performs slots allocation.
 # Only the first 'n' nodes are used.
 proc cluster_allocate_slots {n} {
     set slot 16383
@@ -95,31 +86,6 @@ proc assert_cluster_state {state} {
         } else {
             fail "Cluster node $id cluster_state:[CI $id cluster_state]"
         }
-    }
-
-    wait_for_secrets_match 50 100
-}
-
-proc num_unique_secrets {} {
-    set secrets [list]
-    foreach_redis_id id {
-        if {[instance_is_killed redis $id]} continue
-        lappend secrets [R $id debug internal_secret]
-    }
-    set num_secrets [llength [lsort -unique $secrets]]
-    return $num_secrets
-}
-
-# Check that cluster nodes agree about "state", or raise an error.
-proc assert_secrets_match {} {
-    assert_equal {1} [num_unique_secrets]
-}
-
-proc wait_for_secrets_match {maxtries delay} {
-    wait_for_condition $maxtries $delay {
-        [num_unique_secrets] eq 1
-    } else {
-        fail "Failed waiting for secrets to sync"
     }
 }
 
@@ -154,37 +120,7 @@ proc create_cluster {masters slaves} {
         cluster_allocate_slaves $masters $slaves
     }
     assert_cluster_state ok
-
-    set ::cluster_master_nodes $masters
-    set ::cluster_replica_nodes $slaves
 }
-
-proc cluster_allocate_with_continuous_slots {n} {
-    set slot 16383
-    set avg [expr ($slot+1) / $n]
-    while {$slot >= 0} {
-        set node [expr $slot/$avg >= $n ? $n-1 : $slot/$avg]
-        lappend slots_$node $slot
-        incr slot -1
-    }
-    for {set j 0} {$j < $n} {incr j} {
-        R $j cluster addslots {*}[set slots_${j}]
-    }
-}
-
-# Create a cluster composed of the specified number of masters and slaves,
-# but with a continuous slot range. 
-proc cluster_create_with_continuous_slots {masters slaves} {
-    cluster_allocate_with_continuous_slots $masters
-    if {$slaves} {
-        cluster_allocate_slaves $masters $slaves
-    }
-    assert_cluster_state ok
-
-    set ::cluster_master_nodes $masters
-    set ::cluster_replica_nodes $slaves
-}
-
 
 # Set the cluster node-timeout to all the reachalbe nodes.
 proc set_cluster_node_timeout {to} {
@@ -206,46 +142,4 @@ proc cluster_write_test {id} {
         assert {[$cluster get key.$j] eq "$prefix.$j"}
     }
     $cluster close
-}
-
-# Check if cluster configuration is consistent.
-proc cluster_config_consistent {} {
-    for {set j 0} {$j < $::cluster_master_nodes + $::cluster_replica_nodes} {incr j} {
-        if {$j == 0} {
-            set base_cfg [R $j cluster slots]
-            set base_secret [R $j debug internal_secret]
-        } else {
-            set cfg [R $j cluster slots]
-            set secret [R $j debug internal_secret]
-            if {$cfg != $base_cfg || $secret != $base_secret} {
-                return 0
-            }
-        }
-    }
-
-    return 1
-}
-
-# Wait for cluster configuration to propagate and be consistent across nodes.
-proc wait_for_cluster_propagation {} {
-    wait_for_condition 50 100 {
-        [cluster_config_consistent] eq 1
-    } else {
-        fail "cluster config did not reach a consistent state"
-    }
-}
-
-# Check if cluster's view of hostnames is consistent
-proc are_hostnames_propagated {match_string} {
-    for {set j 0} {$j < $::cluster_master_nodes + $::cluster_replica_nodes} {incr j} {
-        set cfg [R $j cluster slots]
-        foreach node $cfg {
-            for {set i 2} {$i < [llength $node]} {incr i} {
-                if {! [string match $match_string [lindex [lindex [lindex $node $i] 3] 1]] } {
-                    return 0
-                }
-            }
-        }
-    }
-    return 1
 }

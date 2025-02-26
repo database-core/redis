@@ -1,9 +1,7 @@
 #include "server.h"
 #include "bio.h"
 #include "atomicvar.h"
-#include "functions.h"
 #include "cluster.h"
-#include "ebuckets.h"
 
 static redisAtomic size_t lazyfree_objects = 0;
 static redisAtomic size_t lazyfreed_objects = 0;
@@ -21,74 +19,40 @@ void lazyfreeFreeObject(void *args[]) {
  * database which was substituted with a fresh one in the main thread
  * when the database was logically deleted. */
 void lazyfreeFreeDatabase(void *args[]) {
-    kvstore *da1 = args[0];
-    kvstore *da2 = args[1];
-    ebuckets oldHfe = args[2];
-    ebDestroy(&oldHfe, &hashExpireBucketsType, NULL);
-    size_t numkeys = kvstoreSize(da1);
-    kvstoreRelease(da1);
-    kvstoreRelease(da2);
+    dict *ht1 = (dict *) args[0];
+    dict *ht2 = (dict *) args[1];
+
+    size_t numkeys = dictSize(ht1);
+    dictRelease(ht1);
+    dictRelease(ht2);
     atomicDecr(lazyfree_objects,numkeys);
     atomicIncr(lazyfreed_objects,numkeys);
-
-#if defined(USE_JEMALLOC)
-    /* Only clear the current thread cache.
-     * Ignore the return call since this will fail if the tcache is disabled. */
-    je_mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
-
-    jemalloc_purge();
-#endif
 }
 
-/* Release the key tracking table. */
+/* Release the skiplist mapping Redis Cluster keys to slots in the
+ * lazyfree thread. */
+void lazyfreeFreeSlotsMap(void *args[]) {
+    rax *rt = args[0];
+    size_t len = rt->numele;
+    raxFree(rt);
+    atomicDecr(lazyfree_objects,len);
+    atomicIncr(lazyfreed_objects,len);
+}
+
+/* Release the rax mapping Redis Cluster keys to slots in the
+ * lazyfree thread. */
 void lazyFreeTrackingTable(void *args[]) {
     rax *rt = args[0];
     size_t len = rt->numele;
-    freeTrackingRadixTree(rt);
+    raxFree(rt);
     atomicDecr(lazyfree_objects,len);
     atomicIncr(lazyfreed_objects,len);
 }
 
-/* Release the error stats rax tree. */
-void lazyFreeErrors(void *args[]) {
-    rax *errors = args[0];
-    size_t len = errors->numele;
-    raxFreeWithCallback(errors, zfree);
-    atomicDecr(lazyfree_objects,len);
-    atomicIncr(lazyfreed_objects,len);
-}
-
-/* Release the lua_scripts dict. */
 void lazyFreeLuaScripts(void *args[]) {
     dict *lua_scripts = args[0];
-    list *lua_scripts_lru_list = args[1];
-    lua_State *lua = args[2];
     long long len = dictSize(lua_scripts);
-    freeLuaScriptsSync(lua_scripts, lua_scripts_lru_list, lua);
-    atomicDecr(lazyfree_objects,len);
-    atomicIncr(lazyfreed_objects,len);
-}
-
-/* Release the functions ctx. */
-void lazyFreeFunctionsCtx(void *args[]) {
-    functionsLibCtx *functions_lib_ctx = args[0];
-    dict *engs = args[1];
-    size_t len = functionsLibCtxFunctionsLen(functions_lib_ctx);
-    functionsLibCtxFree(functions_lib_ctx);
-    len += dictSize(engs);
-    dictRelease(engs);
-    atomicDecr(lazyfree_objects,len);
-    atomicIncr(lazyfreed_objects,len);
-}
-
-/* Release replication backlog referencing memory. */
-void lazyFreeReplicationBacklogRefMem(void *args[]) {
-    list *blocks = args[0];
-    rax *index = args[1];
-    long long len = listLength(blocks);
-    len += raxSize(index);
-    listRelease(blocks);
-    raxFree(index);
+    dictRelease(lua_scripts);
     atomicDecr(lazyfree_objects,len);
     atomicIncr(lazyfreed_objects,len);
 }
@@ -107,10 +71,6 @@ size_t lazyfreeGetFreedObjectsCount(void) {
     return aux;
 }
 
-void lazyfreeResetStats(void) {
-    atomicSet(lazyfreed_objects,0);
-}
-
 /* Return the amount of work needed in order to free an object.
  * The return value is not always the actual number of allocations the
  * object is composed of, but a number proportional to it.
@@ -126,8 +86,8 @@ void lazyfreeResetStats(void) {
  *
  * For lists the function returns the number of elements in the quicklist
  * representing the list. */
-size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
-    if (obj->type == OBJ_LIST && obj->encoding == OBJ_ENCODING_QUICKLIST) {
+size_t lazyfreeGetFreeEffort(robj *key, robj *obj) {
+    if (obj->type == OBJ_LIST) {
         quicklist *ql = obj->ptr;
         return ql->len;
     } else if (obj->type == OBJ_SET && obj->encoding == OBJ_ENCODING_HT) {
@@ -150,7 +110,7 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
         /* Every consumer group is an allocation and so are the entries in its
          * PEL. We use size of the first group's PEL as an estimate for all
          * others. */
-        if (s->cgroups && raxSize(s->cgroups)) {
+        if (s->cgroups) {
             raxIterator ri;
             streamCG *cg;
             raxStart(&ri,s->cgroups);
@@ -164,29 +124,72 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
         }
         return effort;
     } else if (obj->type == OBJ_MODULE) {
-        size_t effort = moduleGetFreeEffort(key, obj, dbid);
-        /* If the module's free_effort returns 0, we will use asynchronous free
-         * memory by default. */
-        return effort == 0 ? ULONG_MAX : effort;
+        moduleValue *mv = obj->ptr;
+        moduleType *mt = mv->type;
+        if (mt->free_effort != NULL) {
+            size_t effort  = mt->free_effort(key,mv->value);
+            /* If the module's free_effort returns 0, it will use asynchronous free
+             memory by default */
+            return effort == 0 ? ULONG_MAX : effort;
+        } else {
+            return 1;
+        }
     } else {
         return 1; /* Everything else is a single allocation. */
     }
 }
 
-/* If there are enough allocations to free the value object asynchronously, it
- * may be put into a lazy free list instead of being freed synchronously. The
- * lazy free list will be reclaimed in a different bio.c thread. If the value is
- * composed of a few allocations, to free in a lazy way is actually just
- * slower... So under a certain limit we just free the object synchronously. */
+/* Delete a key, value, and associated expiration entry if any, from the DB.
+ * If there are enough allocations to free the value object may be put into
+ * a lazy free list instead of being freed synchronously. The lazy free list
+ * will be reclaimed in a different bio.c thread. */
 #define LAZYFREE_THRESHOLD 64
+int dbAsyncDelete(redisDb *db, robj *key) {
+    /* Deleting an entry from the expires dict will not free the sds of
+     * the key, because it is shared with the main dictionary. */
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+
+    /* If the value is composed of a few allocations, to free in a lazy way
+     * is actually just slower... So under a certain limit we just free
+     * the object synchronously. */
+    dictEntry *de = dictUnlink(db->dict,key->ptr);
+    if (de) {
+        robj *val = dictGetVal(de);
+
+        /* Tells the module that the key has been unlinked from the database. */
+        moduleNotifyKeyUnlink(key,val);
+
+        size_t free_effort = lazyfreeGetFreeEffort(key,val);
+
+        /* If releasing the object is too much work, do it in the background
+         * by adding the object to the lazy free list.
+         * Note that if the object is shared, to reclaim it now it is not
+         * possible. This rarely happens, however sometimes the implementation
+         * of parts of the Redis core may call incrRefCount() to protect
+         * objects, and then call dbDelete(). In this case we'll fall
+         * through and reach the dictFreeUnlinkedEntry() call, that will be
+         * equivalent to just calling decrRefCount(). */
+        if (free_effort > LAZYFREE_THRESHOLD && val->refcount == 1) {
+            atomicIncr(lazyfree_objects,1);
+            bioCreateLazyFreeJob(lazyfreeFreeObject,1, val);
+            dictSetVal(db->dict,de,NULL);
+        }
+    }
+
+    /* Release the key-val pair, or just the key if we set the val
+     * field to NULL in order to lazy free it later. */
+    if (de) {
+        dictFreeUnlinkedEntry(db->dict,de);
+        if (server.cluster_enabled) slotToKeyDel(key->ptr);
+        return 1;
+    } else {
+        return 0;
+    }
+}
 
 /* Free an object, if the object is huge enough, free it in async way. */
-void freeObjAsync(robj *key, robj *obj, int dbid) {
-    size_t free_effort = lazyfreeGetFreeEffort(key,obj,dbid);
-    /* Note that if the object is shared, to reclaim it now it is not
-     * possible. This rarely happens, however sometimes the implementation
-     * of parts of the Redis core may call incrRefCount() to protect
-     * objects, and then call dbDelete(). */
+void freeObjAsync(robj *key, robj *obj) {
+    size_t free_effort = lazyfreeGetFreeEffort(key,obj);
     if (free_effort > LAZYFREE_THRESHOLD && obj->refcount == 1) {
         atomicIncr(lazyfree_objects,1);
         bioCreateLazyFreeJob(lazyfreeFreeObject,1,obj);
@@ -199,76 +202,31 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */
 void emptyDbAsync(redisDb *db) {
-    int slot_count_bits = 0;
-    int flags = KVSTORE_ALLOCATE_DICTS_ON_DEMAND;
-    if (server.cluster_enabled) {
-        slot_count_bits = CLUSTER_SLOT_MASK_BITS;
-        flags |= KVSTORE_FREE_EMPTY_DICTS;
-    }
-    kvstore *oldkeys = db->keys, *oldexpires = db->expires;
-    ebuckets oldHfe = db->hexpires;
-    db->keys = kvstoreCreate(&dbDictType, slot_count_bits, flags | KVSTORE_ALLOC_META_KEYS_HIST);
-    db->expires = kvstoreCreate(&dbExpiresDictType, slot_count_bits, flags);
-    db->hexpires = ebCreate();
-    atomicIncr(lazyfree_objects, kvstoreSize(oldkeys));
-    bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldHfe);
+    dict *oldht1 = db->dict, *oldht2 = db->expires;
+    db->dict = dictCreate(&dbDictType,NULL);
+    db->expires = dictCreate(&dbExpiresDictType,NULL);
+    atomicIncr(lazyfree_objects,dictSize(oldht1));
+    bioCreateLazyFreeJob(lazyfreeFreeDatabase,2,oldht1,oldht2);
 }
 
-/* Free the key tracking table.
- * If the table is huge enough, free it in async way. */
+/* Release the radix tree mapping Redis Cluster keys to slots asynchronously. */
+void freeSlotsToKeysMapAsync(rax *rt) {
+    atomicIncr(lazyfree_objects,rt->numele);
+    bioCreateLazyFreeJob(lazyfreeFreeSlotsMap,1,rt);
+}
+
+/* Free an object, if the object is huge enough, free it in async way. */
 void freeTrackingRadixTreeAsync(rax *tracking) {
-    /* Because this rax has only keys and no values so we use numnodes. */
-    if (tracking->numnodes > LAZYFREE_THRESHOLD) {
-        atomicIncr(lazyfree_objects,tracking->numele);
-        bioCreateLazyFreeJob(lazyFreeTrackingTable,1,tracking);
-    } else {
-        freeTrackingRadixTree(tracking);
-    }
+    atomicIncr(lazyfree_objects,tracking->numele);
+    bioCreateLazyFreeJob(lazyFreeTrackingTable,1,tracking);
 }
 
-/* Free the error stats rax tree.
- * If the rax tree is huge enough, free it in async way. */
-void freeErrorsRadixTreeAsync(rax *errors) {
-    /* Because this rax has only keys and no values so we use numnodes. */
-    if (errors->numnodes > LAZYFREE_THRESHOLD) {
-        atomicIncr(lazyfree_objects,errors->numele);
-        bioCreateLazyFreeJob(lazyFreeErrors,1,errors);
-    } else {
-        raxFreeWithCallback(errors, zfree);
-    }
-}
-
-/* Free lua_scripts dict and lru list, if the dict is huge enough, free them in async way.
- * Close lua interpreter, if there are a lot of lua scripts, close it in async way. */
-void freeLuaScriptsAsync(dict *lua_scripts, list *lua_scripts_lru_list, lua_State *lua) {
+/* Free lua_scripts dict, if the dict is huge enough, free it in async way. */
+void freeLuaScriptsAsync(dict *lua_scripts) {
     if (dictSize(lua_scripts) > LAZYFREE_THRESHOLD) {
         atomicIncr(lazyfree_objects,dictSize(lua_scripts));
-        bioCreateLazyFreeJob(lazyFreeLuaScripts,3,lua_scripts,lua_scripts_lru_list,lua);
+        bioCreateLazyFreeJob(lazyFreeLuaScripts,1,lua_scripts);
     } else {
-        freeLuaScriptsSync(lua_scripts, lua_scripts_lru_list, lua);
-    }
-}
-
-/* Free functions ctx, if the functions ctx contains enough functions, free it in async way. */
-void freeFunctionsAsync(functionsLibCtx *functions_lib_ctx, dict *engs) {
-    if (functionsLibCtxFunctionsLen(functions_lib_ctx) > LAZYFREE_THRESHOLD) {
-        atomicIncr(lazyfree_objects,functionsLibCtxFunctionsLen(functions_lib_ctx)+dictSize(engs));
-        bioCreateLazyFreeJob(lazyFreeFunctionsCtx,2,functions_lib_ctx,engs);
-    } else {
-        functionsLibCtxFree(functions_lib_ctx);
-        dictRelease(engs);
-    }
-}
-
-/* Free replication backlog referencing buffer blocks and rax index. */
-void freeReplicationBacklogRefMemAsync(list *blocks, rax *index) {
-    if (listLength(blocks) > LAZYFREE_THRESHOLD ||
-        raxSize(index) > LAZYFREE_THRESHOLD)
-    {
-        atomicIncr(lazyfree_objects,listLength(blocks)+raxSize(index));
-        bioCreateLazyFreeJob(lazyFreeReplicationBacklogRefMem,2,blocks,index);
-    } else {
-        listRelease(blocks);
-        raxFree(index);
+        dictRelease(lua_scripts);
     }
 }

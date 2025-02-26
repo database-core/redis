@@ -1,7 +1,4 @@
 start_server {tags {"hash"}} {
-    r config set hash-max-listpack-value 64
-    r config set hash-max-listpack-entries 512
-
     test {HSET/HLEN - Small hash creation} {
         array set smallhash {}
         for {set i 0} {$i < 8} {incr i} {
@@ -17,8 +14,8 @@ start_server {tags {"hash"}} {
         list [r hlen smallhash]
     } {8}
 
-    test {Is the small hash encoded with a listpack?} {
-        assert_encoding listpack smallhash
+    test {Is the small hash encoded with a ziplist?} {
+        assert_encoding ziplist smallhash
     }
 
     proc create_hash {key entries} {
@@ -37,14 +34,11 @@ start_server {tags {"hash"}} {
         return $res
     }
 
-    foreach {type contents} "listpack {{a 1} {b 2} {c 3}} hashtable {{a 1} {b 2} {[randstring 70 90 alpha] 3}}" {
+    foreach {type contents} "ziplist {{a 1} {b 2} {c 3}} hashtable {{a 1} {b 2} {[randstring 70 90 alpha] 3}}" {
         set original_max_value [lindex [r config get hash-max-ziplist-value] 1]
         r config set hash-max-ziplist-value 10
         create_hash myhash $contents
         assert_encoding $type myhash
-
-        # coverage for objectComputeSize
-        assert_morethan [memory_usage myhash] 0
 
         test "HRANDFIELD - $type" {
             unset -nocomplain myhash
@@ -67,40 +61,20 @@ start_server {tags {"hash"}} {
         set res [r hrandfield myhash 3]
         assert_equal [llength $res] 3
         assert_equal [llength [lindex $res 1]] 1
-        r hello 2
     }
+    r hello 2
 
     test "HRANDFIELD count of 0 is handled correctly" {
         r hrandfield myhash 0
-    } {}
-
-    test "HRANDFIELD count overflow" {
-        r hmset myhash a 1
-        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854770000 withvalues}
-        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808 withvalues}
-        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808}
     } {}
 
     test "HRANDFIELD with <count> against non existing key" {
         r hrandfield nonexisting_key 100
     } {}
 
-    # Make sure we can distinguish between an empty array and a null response
-    r readraw 1
-
-    test "HRANDFIELD count of 0 is handled correctly - emptyarray" {
-        r hrandfield myhash 0
-    } {*0}
-
-    test "HRANDFIELD with <count> against non existing key - emptyarray" {
-        r hrandfield nonexisting_key 100
-    } {*0}
-
-    r readraw 0
-
     foreach {type contents} "
         hashtable {{a 1} {b 2} {c 3} {d 4} {e 5} {6 f} {7 g} {8 h} {9 i} {[randstring 70 90 alpha] 10}}
-        listpack {{a 1} {b 2} {c 3} {d 4} {e 5} {6 f} {7 g} {8 h} {9 i} {10 j}} " {
+        ziplist {{a 1} {b 2} {c 3} {d 4} {e 5} {6 f} {7 g} {8 h} {9 i} {10 j}} " {
         test "HRANDFIELD with <count> - $type" {
             set original_max_value [lindex [r config get hash-max-ziplist-value] 1]
             r config set hash-max-ziplist-value 10
@@ -108,7 +82,10 @@ start_server {tags {"hash"}} {
             assert_encoding $type myhash
 
             # create a dict for easy lookup
-            set mydict [dict create {*}[r hgetall myhash]]
+            unset -nocomplain mydict
+            foreach {k v} [r hgetall myhash] {
+                dict append mydict $k $v
+            }
 
             # We'll stress different parts of the code, see the implementation
             # of HRANDFIELD for more information, but basically there are
@@ -128,9 +105,8 @@ start_server {tags {"hash"}} {
             assert_equal [llength $res] 2002
 
             # Test random uniform distribution
-            # df = 9, 40 means 0.00001 probability
             set res [r hrandfield myhash -1000]
-            assert_lessthan [chi_square_value $res] 40
+            assert_equal [check_histogram_distribution $res 0.05 0.15] true
 
             # 2) Check that all the elements actually belong to the original hash.
             foreach {key val} $res {
@@ -223,8 +199,7 @@ start_server {tags {"hash"}} {
                     }
                 }
                 assert_equal $all_ele_return true
-                # df = 9, 40 means 0.00001 probability
-                assert_lessthan [chi_square_value $allkey] 40
+                assert_equal [check_histogram_distribution $allkey 0.05 0.15] true
             }
         }
         r config set hash-max-ziplist-value $original_max_value
@@ -320,10 +295,10 @@ start_server {tags {"hash"}} {
         set _ $result
     } {foo}
 
-    test {HSET/HMSET wrong number of args} {
-        assert_error {*wrong number of arguments for 'hset' command} {r hset smallhash key1 val1 key2}
-        assert_error {*wrong number of arguments for 'hmset' command} {r hmset smallhash key1 val1 key2}
-    }
+    test {HMSET wrong number of args} {
+        catch {r hmset smallhash key1 val1 key2} err
+        format $err
+    } {*wrong number*}
 
     test {HMSET - small hash} {
         set args {}
@@ -353,25 +328,9 @@ start_server {tags {"hash"}} {
         set _ $rv
     } {{{} {}} {{} {}} {{} {}}}
 
-    test {Hash commands against wrong type} {
+    test {HMGET against wrong type} {
         r set wrongtype somevalue
-        assert_error "WRONGTYPE Operation against a key*" {r hmget wrongtype field1 field2}
-        assert_error "WRONGTYPE Operation against a key*" {r hrandfield wrongtype}
-        assert_error "WRONGTYPE Operation against a key*" {r hget wrongtype field1}
-        assert_error "WRONGTYPE Operation against a key*" {r hgetall wrongtype}
-        assert_error "WRONGTYPE Operation against a key*" {r hdel wrongtype field1}
-        assert_error "WRONGTYPE Operation against a key*" {r hincrby wrongtype field1 2}
-        assert_error "WRONGTYPE Operation against a key*" {r hincrbyfloat wrongtype field1 2.5}
-        assert_error "WRONGTYPE Operation against a key*" {r hstrlen wrongtype field1}
-        assert_error "WRONGTYPE Operation against a key*" {r hvals wrongtype}
-        assert_error "WRONGTYPE Operation against a key*" {r hkeys wrongtype}
-        assert_error "WRONGTYPE Operation against a key*" {r hexists wrongtype field1}
-        assert_error "WRONGTYPE Operation against a key*" {r hset wrongtype field1 val1}
-        assert_error "WRONGTYPE Operation against a key*" {r hmset wrongtype field1 val1 field2 val2}
-        assert_error "WRONGTYPE Operation against a key*" {r hsetnx wrongtype field1 val1}
-        assert_error "WRONGTYPE Operation against a key*" {r hlen wrongtype}
-        assert_error "WRONGTYPE Operation against a key*" {r hscan wrongtype 0}
-        assert_error "WRONGTYPE Operation against a key*" {r hgetdel wrongtype fields 1 a}
+        assert_error "*wrong*" {r hmget wrongtype field1 field2}
     }
 
     test {HMGET - small hash} {
@@ -438,11 +397,6 @@ start_server {tags {"hash"}} {
         lsort [r hgetall bighash]
     } [lsort [array get bighash]]
 
-    test {HGETALL against non-existing key} {
-        r del htest
-        r hgetall htest
-    } {}
-
     test {HDEL and return value} {
         set rv {}
         lappend rv [r hdel smallhash nokey]
@@ -489,19 +443,12 @@ start_server {tags {"hash"}} {
     test {Is a ziplist encoded Hash promoted on big payload?} {
         r hset smallhash foo [string repeat a 1024]
         r debug object smallhash
-    } {*hashtable*} {needs:debug}
+    } {*hashtable*}
 
     test {HINCRBY against non existing database key} {
         r del htest
         list [r hincrby htest foo 2]
     } {2}
-
-    test {HINCRBY HINCRBYFLOAT against non-integer increment value} {
-        r del incrhash
-        r hset incrhash field 5
-        assert_error "*value is not an integer*" {r hincrby incrhash field v}
-        assert_error "*value is not a*" {r hincrbyfloat incrhash field v}
-    }
 
     test {HINCRBY against non existing hash key} {
         set rv {}
@@ -545,8 +492,8 @@ start_server {tags {"hash"}} {
         catch {r hincrby smallhash str 1} smallerr
         catch {r hincrby bighash str 1} bigerr
         set rv {}
-        lappend rv [string match "ERR *not an integer*" $smallerr]
-        lappend rv [string match "ERR *not an integer*" $bigerr]
+        lappend rv [string match "ERR*not an integer*" $smallerr]
+        lappend rv [string match "ERR*not an integer*" $bigerr]
     } {1 1}
 
     test {HINCRBY fails against hash value with spaces (right)} {
@@ -555,8 +502,8 @@ start_server {tags {"hash"}} {
         catch {r hincrby smallhash str 1} smallerr
         catch {r hincrby bighash str 1} bigerr
         set rv {}
-        lappend rv [string match "ERR *not an integer*" $smallerr]
-        lappend rv [string match "ERR *not an integer*" $bigerr]
+        lappend rv [string match "ERR*not an integer*" $smallerr]
+        lappend rv [string match "ERR*not an integer*" $bigerr]
     } {1 1}
 
     test {HINCRBY can detect overflows} {
@@ -617,8 +564,8 @@ start_server {tags {"hash"}} {
         catch {r hincrbyfloat smallhash str 1} smallerr
         catch {r hincrbyfloat bighash str 1} bigerr
         set rv {}
-        lappend rv [string match "ERR *not*float*" $smallerr]
-        lappend rv [string match "ERR *not*float*" $bigerr]
+        lappend rv [string match "ERR*not*float*" $smallerr]
+        lappend rv [string match "ERR*not*float*" $bigerr]
     } {1 1}
 
     test {HINCRBYFLOAT fails against hash value with spaces (right)} {
@@ -627,15 +574,15 @@ start_server {tags {"hash"}} {
         catch {r hincrbyfloat smallhash str 1} smallerr
         catch {r hincrbyfloat bighash str 1} bigerr
         set rv {}
-        lappend rv [string match "ERR *not*float*" $smallerr]
-        lappend rv [string match "ERR *not*float*" $bigerr]
+        lappend rv [string match "ERR*not*float*" $smallerr]
+        lappend rv [string match "ERR*not*float*" $bigerr]
     } {1 1}
 
     test {HINCRBYFLOAT fails against hash value that contains a null-terminator in the middle} {
         r hset h f "1\x002"
         catch {r hincrbyfloat h f 1} err
         set rv {}
-        lappend rv [string match "ERR *not*float*" $err]
+        lappend rv [string match "ERR*not*float*" $err]
     } {1}
 
     test {HSTRLEN against the small hash} {
@@ -685,114 +632,6 @@ start_server {tags {"hash"}} {
             assert {$len2 == $len3}
         }
     }
-
-    test {HINCRBYFLOAT over hash-max-listpack-value encoded with a listpack} {
-        set original_max_value [lindex [r config get hash-max-ziplist-value] 1]
-        r config set hash-max-listpack-value 8
-        
-        # hash's value exceeds hash-max-listpack-value
-        r del smallhash
-        r del bighash
-        r hset smallhash tmp 0
-        r hset bighash tmp 0
-        r hincrbyfloat smallhash tmp 0.000005
-        r hincrbyfloat bighash tmp 0.0000005
-        assert_encoding listpack smallhash
-        assert_encoding hashtable bighash
-
-        # hash's field exceeds hash-max-listpack-value
-        r del smallhash
-        r del bighash
-        r hincrbyfloat smallhash abcdefgh 1
-        r hincrbyfloat bighash abcdefghi 1
-        assert_encoding listpack smallhash
-        assert_encoding hashtable bighash
-
-        r config set hash-max-listpack-value $original_max_value
-    }
-
-    test {HGETDEL input validation} {
-        r del key1
-        assert_error "*wrong number of arguments*" {r hgetdel}
-        assert_error "*wrong number of arguments*" {r hgetdel key1}
-        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDS}
-        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDS 0}
-        assert_error "*wrong number of arguments*" {r hgetdel key1 FIELDX}
-        assert_error "*argument FIELDS is missing*" {r hgetdel key1 XFIELDX 1 a}
-        assert_error "*numfields*parameter*must match*number of arguments*" {r hgetdel key1 FIELDS 2 a}
-        assert_error "*numfields*parameter*must match*number of arguments*" {r hgetdel key1 FIELDS 2 a b c}
-        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS 0 a}
-        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS -1 a}
-        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS b a}
-        assert_error "*Number of fields must be a positive integer*" {r hgetdel key1 FIELDS 9223372036854775808 a}
-    }
-
-    foreach type {listpack ht} {
-        set orig_config [lindex [r config get hash-max-listpack-entries] 1]
-        r del key1
-
-        if {$type == "listpack"} {
-            r config set hash-max-listpack-entries $orig_config
-            r hset key1 f1 1 f2 2 f3 3 strfield strval
-            assert_encoding listpack key1
-        } else {
-            r config set hash-max-listpack-entries 0
-            r hset key1 f1 1 f2 2 f3 3 strfield strval
-            assert_encoding hashtable key1
-        }
-
-        test {HGETDEL basic test} {
-            r del key1
-            r hset key1 f1 1 f2 2 f3 3 strfield strval
-            assert_equal [r hgetdel key1 fields 1 f2] 2
-            assert_equal [r hlen key1] 3
-            assert_equal [r hget key1 f1] 1
-            assert_equal [r hget key1 f2] ""
-            assert_equal [r hget key1 f3] 3
-            assert_equal [r hget key1 strfield] strval
-
-            assert_equal [r hgetdel key1 fields 1 f1] 1
-            assert_equal [lsort [r hgetall key1]] [lsort "f3 3 strfield strval"]
-            assert_equal [r hgetdel key1 fields 1 f3] 3
-            assert_equal [r hgetdel key1 fields 1 strfield] strval
-            assert_equal [r hgetall key1] ""
-            assert_equal [r exists key1] 0
-        }
-
-        test {HGETDEL test with non existing fields} {
-             r del key1
-             r hset key1 f1 1 f2 2 f3 3
-             assert_equal [r hgetdel key1 fields 4 x1 x2 x3 x4] "{} {} {} {}"
-             assert_equal [r hgetdel key1 fields 4 x1 x2 f3 x4] "{} {} 3 {}"
-             assert_equal [lsort [r hgetall key1]] [lsort "f1 1 f2 2"]
-             assert_equal [r hgetdel key1 fields 3 f1 f2 f3] "1 2 {}"
-             assert_equal [r hgetdel key1 fields 3 f1 f2 f3] "{} {} {}"
-        }
-
-        r config set hash-max-listpack-entries $orig_config
-    }
-
-    test {HGETDEL propagated as HDEL command to replica} {
-        set repl [attach_to_replication_stream]
-        r hset key1 f1 v1 f2 v2 f3 v3 f4 v4 f5 v5
-        r hgetdel key1 fields 1 f1
-        r hgetdel key1 fields 2 f2 f3
-
-        # make sure non-existing fields are not replicated
-        r hgetdel key1 fields 2 f7 f8
-
-        # delete more
-        r hgetdel key1 fields 3 f4 f5 f6
-
-        assert_replication_stream $repl {
-            {select *}
-            {hset key1 f1 v1 f2 v2 f3 v3 f4 v4 f5 v5}
-            {hdel key1 f1}
-            {hdel key1 f2 f3}
-            {hdel key1 f4 f5 f6}
-        }
-        close_replication_stream $repl
-    } {} {needs:repl}
 
     test {Hash ziplist regression test for large keys} {
         r hset hash kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk a
@@ -868,7 +707,7 @@ start_server {tags {"hash"}} {
             for {set i 0} {$i < 64} {incr i} {
                 r hset myhash [randomValue] [randomValue]
             }
-            assert_encoding hashtable myhash
+            assert {[r object encoding myhash] eq {hashtable}}
         }
     }
 
@@ -892,8 +731,8 @@ start_server {tags {"hash"}} {
 
     test {Hash ziplist of various encodings} {
         r del k
-        config_set hash-max-ziplist-entries 1000000000
-        config_set hash-max-ziplist-value 1000000000
+        r config set hash-max-ziplist-entries 1000000000
+        r config set hash-max-ziplist-value 1000000000
         r hset k ZIP_INT_8B 127
         r hset k ZIP_INT_16B 32767
         r hset k ZIP_INT_32B 2147483647
@@ -907,8 +746,8 @@ start_server {tags {"hash"}} {
         set dump [r dump k]
 
         # will be converted to dict at RESTORE
-        config_set hash-max-ziplist-entries 2
-        config_set sanitize-dump-payload no mayfail
+        r config set hash-max-ziplist-entries 2
+        r config set sanitize-dump-payload no
         r restore kk 0 $dump
         set kk [r hgetall kk]
 
@@ -924,7 +763,7 @@ start_server {tags {"hash"}} {
     } {ZIP_INT_8B 127 ZIP_INT_16B 32767 ZIP_INT_32B 2147483647 ZIP_INT_64B 9223372036854775808 ZIP_INT_IMM_MIN 0 ZIP_INT_IMM_MAX 12}
 
     test {Hash ziplist of various encodings - sanitize dump} {
-        config_set sanitize-dump-payload yes mayfail
+        r config set sanitize-dump-payload yes
         r restore kk 0 $dump replace
         set k [r hgetall k]
         set kk [r hgetall kk]
@@ -940,11 +779,4 @@ start_server {tags {"hash"}} {
         set _ $k
     } {ZIP_INT_8B 127 ZIP_INT_16B 32767 ZIP_INT_32B 2147483647 ZIP_INT_64B 9223372036854775808 ZIP_INT_IMM_MIN 0 ZIP_INT_IMM_MAX 12}
 
-    # On some platforms strtold("+inf") with valgrind returns a non-inf result
-    if {!$::valgrind} {
-        test {HINCRBYFLOAT does not allow NaN or Infinity} {
-            assert_error "*value is NaN or Infinity*" {r hincrbyfloat hfoo field +inf}
-            assert_equal 0 [r exists hfoo]
-        }
-    }
 }

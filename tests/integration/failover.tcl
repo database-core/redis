@@ -1,6 +1,6 @@
-start_server {tags {"failover external:skip"} overrides {save {}}} {
-start_server {overrides {save {}}} {
-start_server {overrides {save {}}} {
+start_server {tags {"failover"}} {
+start_server {} {
+start_server {} {
     set node_0 [srv 0 client]
     set node_0_host [srv 0 host]
     set node_0_port [srv 0 port]
@@ -33,12 +33,6 @@ start_server {overrides {save {}}} {
         $node_2 replicaof $node_0_host $node_0_port
         wait_for_sync $node_1
         wait_for_sync $node_2
-        # wait for both replicas to be online from the perspective of the master
-        wait_for_condition 50 100 {
-            [string match "*slave0:*,state=online*slave1:*,state=online*" [$node_0 info replication]]
-        } else {
-            fail "replica didn't online in time"
-        }
     }
 
     test {failover command fails with invalid host} {
@@ -72,13 +66,13 @@ start_server {overrides {save {}}} {
 
         # Generate a delta between primary and replica
         set load_handler [start_write_load $node_0_host $node_0_port 5]
-        pause_process [srv -1 pid]
+        exec kill -SIGSTOP [srv -1 pid]
         wait_for_condition 50 100 {
             [s 0 total_commands_processed] > 100
         } else {
             fail "Node 0 did not accept writes"
         }
-        resume_process [srv -1 pid]
+        exec kill -SIGCONT [srv -1 pid]
 
         # Execute the failover
         $node_0 failover to $node_1_host $node_1_port
@@ -89,11 +83,7 @@ start_server {overrides {save {}}} {
         } else {
             fail "Failover from node 0 to node 1 did not finish"
         }
-
-        # stop the write load and make sure no more commands processed
         stop_write_load $load_handler
-        wait_load_handlers_disconnected
-
         $node_2 replicaof $node_1_host $node_1_port
         wait_for_sync $node_0
         wait_for_sync $node_2
@@ -114,7 +104,7 @@ start_server {overrides {save {}}} {
 
         wait_for_ofs_sync $node_1 $node_2
         # We stop node 0 to and make sure node 2 is selected
-        pause_process $node_0_pid
+        exec kill -SIGSTOP $node_0_pid
         $node_1 set CASE 1
         $node_1 FAILOVER
 
@@ -124,7 +114,7 @@ start_server {overrides {save {}}} {
         } else {
             fail "Failover from node 1 to node 2 did not finish"
         }
-        resume_process $node_0_pid
+        exec kill -SIGCONT $node_0_pid
         $node_0 replicaof $node_2_host $node_2_port
 
         wait_for_sync $node_0
@@ -144,7 +134,7 @@ start_server {overrides {save {}}} {
         set initial_psyncs [s 0 sync_partial_ok]
         set initial_syncs [s 0 sync_full]
 
-        pause_process $node_0_pid
+        exec kill -SIGSTOP $node_0_pid
         # node 0 will never acknowledge this write
         $node_2 set case 2
         $node_2 failover to $node_0_host $node_0_port TIMEOUT 100 FORCE
@@ -161,7 +151,7 @@ start_server {overrides {save {}}} {
         assert_match *slave* [$node_1 role]
         assert_match *slave* [$node_2 role]
 
-        resume_process $node_0_pid
+        exec kill -SIGCONT $node_0_pid
 
         # Wait for failover to end
         wait_for_condition 50 100 {
@@ -192,7 +182,7 @@ start_server {overrides {save {}}} {
         set initial_syncs [s 0 sync_full]
 
         # Stop replica so it never catches up
-        pause_process [srv -1 pid]
+        exec kill -SIGSTOP [srv -1 pid]
         $node_0 SET CASE 1
         
         $node_0 failover to [srv -1 host] [srv -1 port] TIMEOUT 500
@@ -203,7 +193,7 @@ start_server {overrides {save {}}} {
             fail "Failover from node_0 to replica did not finish"
         }
 
-        resume_process [srv -1 pid]
+        exec kill -SIGCONT [srv -1 pid]
 
         # We need to make sure the nodes actually sync back up
         wait_for_ofs_sync $node_0 $node_1
@@ -224,7 +214,7 @@ start_server {overrides {save {}}} {
         set initial_syncs [s 0 sync_full]
     
         # Stop replica so it never catches up
-        pause_process [srv -1 pid]
+        exec kill -SIGSTOP [srv -1 pid]
         $node_0 SET CASE 2
         
         $node_0 failover to [srv -1 host] [srv -1 port] TIMEOUT 60000
@@ -236,7 +226,7 @@ start_server {overrides {save {}}} {
         $node_0 failover abort
         assert_match [s 0 master_failover_state] "no-failover"
 
-        resume_process [srv -1 pid]
+        exec kill -SIGCONT [srv -1 pid]
 
         # Just make sure everything is still synced
         wait_for_ofs_sync $node_0 $node_1
@@ -261,11 +251,11 @@ start_server {overrides {save {}}} {
 
         # We pause the target long enough to send a write command
         # during the pause. This write will not be interrupted.
-        pause_process [srv -1 pid]
+        exec kill -SIGSTOP [srv -1 pid]
         set rd [redis_deferring_client]
         $rd SET FOO BAR
         $node_0 failover to $node_1_host $node_1_port
-        resume_process [srv -1 pid]
+        exec kill -SIGCONT [srv -1 pid]
 
         # Wait for failover to end
         wait_for_condition 50 100 {

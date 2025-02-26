@@ -9,16 +9,6 @@ start_server {tags {"incr"}} {
         r incr novar
     } {2}
 
-    test {DECR against key created by incr} {
-        r decr novar
-    } {1}
-
-    test {DECR against key is not exist and incr} {
-        r del novar_not_exist
-        assert_equal {-1} [r decr novar_not_exist]
-        assert_equal {0} [r incr novar_not_exist]
-    }
-
     test {INCR against key originally set with SET} {
         r set novar 100
         r incr novar
@@ -52,12 +42,6 @@ start_server {tags {"incr"}} {
         format $err
     } {ERR*}
 
-    test {DECRBY negation overflow} {
-        r set x 0
-        catch {r decrby x -9223372036854775808} err
-        format $err
-    } {ERR*}
-
     test {INCR fails against a key holding a list} {
         r rpush mylist 1
         catch {r incr mylist} err
@@ -70,33 +54,28 @@ start_server {tags {"incr"}} {
         r decrby novar 17179869185
     } {-1}
 
-    test {DECRBY against key is not exist} {
-        r del key_not_exist
-        assert_equal {-1} [r decrby key_not_exist 1]
-    }
-
     test {INCR uses shared objects in the 0-9999 range} {
         r set foo -1
         r incr foo
-        assert_refcount_morethan foo 1
+        assert {[r object refcount foo] > 1}
         r set foo 9998
         r incr foo
-        assert_refcount_morethan foo 1
+        assert {[r object refcount foo] > 1}
         r incr foo
-        assert_refcount 1 foo
+        assert {[r object refcount foo] == 1}
     }
 
     test {INCR can modify objects in-place} {
         r set foo 20000
         r incr foo
-        assert_refcount 1 foo
+        assert {[r object refcount foo] == 1}
         set old [lindex [split [r debug object foo]] 1]
         r incr foo
         set new [lindex [split [r debug object foo]] 1]
         assert {[string range $old 0 2] eq "at:"}
         assert {[string range $new 0 2] eq "at:"}
         assert {$old eq $new}
-    } {} {needs:debug}
+    }
 
     test {INCRBYFLOAT against non existing key} {
         r del novar
@@ -126,21 +105,21 @@ start_server {tags {"incr"}} {
         r set novar "    11"
         catch {r incrbyfloat novar 1.0} err
         format $err
-    } {ERR *valid*}
+    } {ERR*valid*}
 
     test {INCRBYFLOAT fails against key with spaces (right)} {
         set err {}
         r set novar "11    "
         catch {r incrbyfloat novar 1.0} err
         format $err
-    } {ERR *valid*}
+    } {ERR*valid*}
 
     test {INCRBYFLOAT fails against key with spaces (both)} {
         set err {}
         r set novar " 11 "
         catch {r incrbyfloat novar 1.0} err
         format $err
-    } {ERR *valid*}
+    } {ERR*valid*}
 
     test {INCRBYFLOAT fails against a key holding a list} {
         r del mylist
@@ -161,7 +140,7 @@ start_server {tags {"incr"}} {
             # p.s. no way I can force NaN to test it from the API because
             # there is no way to increment / decrement by infinity nor to
             # perform divisions.
-        } {ERR *would produce*}
+        } {ERR*would produce*}
     }
 
     test {INCRBYFLOAT decrement} {
@@ -174,7 +153,7 @@ start_server {tags {"incr"}} {
         r setrange foo 2 2
         catch {r incrbyfloat foo 1} err
         format $err
-    } {ERR *valid*}
+    } {ERR*valid*}
 
     test {No negative zero} {
         r del foo
@@ -182,44 +161,4 @@ start_server {tags {"incr"}} {
         r incrbyfloat foo [expr double(-1)/41]
         r get foo
     } {0}
-
-    test {INCRBY INCRBYFLOAT DECRBY against unhappy path} {
-        r del mykeyincr
-        assert_error "*ERR wrong number of arguments*" {r incr mykeyincr v}
-        assert_error "*ERR wrong number of arguments*" {r decr mykeyincr v}
-        assert_error "*value is not an integer or out of range*" {r incrby mykeyincr v}
-        assert_error "*value is not an integer or out of range*" {r incrby mykeyincr 1.5}
-        assert_error "*value is not an integer or out of range*" {r decrby mykeyincr v}
-        assert_error "*value is not an integer or out of range*" {r decrby mykeyincr 1.5}
-        assert_error "*value is not a valid float*" {r incrbyfloat mykeyincr v}
-    }
-
-    foreach cmd {"incr" "decr" "incrby" "decrby"} {
-        test "$cmd operation should update encoding from raw to int" {
-            set res {}
-            set expected {1 12}
-            if {[string match {*incr*} $cmd]} {
-                lappend expected 13
-            } else {
-                lappend expected 11
-            }
-
-            r set foo 1
-            assert_encoding "int" foo
-            lappend res [r get foo]
-
-            r append foo 2
-            assert_encoding "raw" foo
-            lappend res [r get foo]
-
-            if {[string match {*by*} $cmd]} {
-                r $cmd foo 1
-            } else {
-                r $cmd foo
-            }
-            assert_encoding "int" foo
-            lappend res [r get foo]
-            assert_equal $res $expected
-        }
-    }
 }

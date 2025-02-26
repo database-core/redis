@@ -1,10 +1,6 @@
-# Sentinel test suite.
-#
-# Copyright (C) 2014-Present, Redis Ltd.
-# All Rights reserved.
-#
-# Licensed under your choice of the Redis Source Available License 2.0
-# (RSALv2) or the Server Side Public License v1 (SSPLv1).
+# Sentinel test suite. Copyright (C) 2014 Salvatore Sanfilippo antirez@gmail.com
+# This software is released under the BSD License. See the COPYING file for
+# more information.
 
 cd tests/sentinel
 source ../instances.tcl
@@ -17,17 +13,8 @@ proc main {} {
     if {$::leaked_fds_file != ""} {
         set ::env(LEAKED_FDS_FILE) $::leaked_fds_file
     }
-    spawn_instance sentinel $::sentinel_base_port $::instances_count {
-        "sentinel deny-scripts-reconfig no"
-        "enable-protected-configs yes"
-        "enable-debug-command yes"
-    } "../tests/includes/sentinel.conf"
-
-    spawn_instance redis $::redis_base_port $::instances_count {
-        "enable-protected-configs yes"
-        "enable-debug-command yes"
-        "save ''"
-    }
+    spawn_instance sentinel $::sentinel_base_port $::instances_count [list "sentinel deny-scripts-reconfig no"] "../tests/includes/sentinel.conf"
+    spawn_instance redis $::redis_base_port $::instances_count
     run_tests
     cleanup
     end_tests

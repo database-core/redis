@@ -2,11 +2,32 @@
  *
  * ----------------------------------------------------------------------------
  *
- * Copyright (c) 2009-Present, Redis Ltd.
+ * Copyright (c) 2009-2016, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "server.h"
@@ -18,10 +39,6 @@
  * mechanism in order to ensure keys are eventually removed when expired even
  * if no access is performed on them.
  *----------------------------------------------------------------------------*/
-
-/* Constants table from pow(0.98, 1) to pow(0.98, 16). 
- * Help calculating the db->avg_ttl. */
-static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 0.885842, 0.868126, 0.850763, 0.833748, 0.817073, 0.800731, 0.784717, 0.769022, 0.753642, 0.738569, 0.723798};
 
 /* Helper function for the activeExpireCycle() function.
  * This function will try to expire the key that is stored in the hash table
@@ -36,18 +53,28 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
  * to the function to avoid too many gettimeofday() syscalls. */
 int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
     long long t = dictGetSignedIntegerVal(de);
-    if (now < t)
-        return 0;
+    mstime_t expire_latency;
+    if (now > t) {
+        sds key = dictGetKey(de);
+        robj *keyobj = createStringObject(key,sdslen(key));
 
-    enterExecutionUnit(1, 0);
-    sds key = dictGetKey(de);
-    robj *keyobj = createStringObject(key,sdslen(key));
-    deleteExpiredKeyAndPropagate(db,keyobj);
-    decrRefCount(keyobj);
-    exitExecutionUnit();
-    /* Propagate the DEL command */
-    postExecutionUnitOperations();
-    return 1;
+        propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
+        latencyStartMonitor(expire_latency);
+        if (server.lazyfree_lazy_expire)
+            dbAsyncDelete(db,keyobj);
+        else
+            dbSyncDelete(db,keyobj);
+        latencyEndMonitor(expire_latency);
+        latencyAddSampleIfNeeded("expire-del",expire_latency);
+        notifyKeyspaceEvent(NOTIFY_EXPIRED,
+            "expired",keyobj,db->id);
+        signalModifiedKey(NULL, db, keyobj);
+        decrRefCount(keyobj);
+        server.stat_expiredkeys++;
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 /* Try to expire a few timed out keys. The algorithm used is adaptive and
@@ -96,93 +123,6 @@ int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
 #define ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE 10 /* % of stale keys after which
                                                    we do extra efforts. */
 
-#define HFE_DB_BASE_ACTIVE_EXPIRE_FIELDS_PER_SEC 10000
-
-/* Data used by the expire dict scan callback. */
-typedef struct {
-    redisDb *db;
-    long long now;
-    unsigned long sampled; /* num keys checked */
-    unsigned long expired; /* num keys expired */
-    long long ttl_sum; /* sum of ttl for key with ttl not yet expired */
-    int ttl_samples; /* num keys with ttl not yet expired */
-} expireScanData;
-
-void expireScanCallback(void *privdata, const dictEntry *const_de) {
-    dictEntry *de = (dictEntry *)const_de;
-    expireScanData *data = privdata;
-    long long ttl  = dictGetSignedIntegerVal(de) - data->now;
-    if (activeExpireCycleTryExpire(data->db, de, data->now)) {
-        data->expired++;
-    }
-    if (ttl > 0) {
-        /* We want the average TTL of keys yet not expired. */
-        data->ttl_sum += ttl;
-        data->ttl_samples++;
-    }
-    data->sampled++;
-}
-
-static inline int isExpiryDictValidForSamplingCb(dict *d) {
-    long long numkeys = dictSize(d);
-    unsigned long buckets = dictBuckets(d);
-    /* When there are less than 1% filled buckets, sampling the key
-     * space is expensive, so stop here waiting for better times...
-     * The dictionary will be resized asap. */
-    if (buckets > DICT_HT_INITIAL_SIZE && (numkeys * 100/buckets < 1)) {
-        return C_ERR;
-    }
-    return C_OK;
-}
-
-/* Active expiration Cycle for hash-fields.
- *
- * Note that releasing fields is expected to be more predictable and rewarding
- * than releasing keys because it is stored in `ebuckets` DS which optimized for
- * active expiration and in addition the deletion of fields is simple to handle. */
-static inline void activeExpireHashFieldCycle(int type) {
-    /* Remember current db across calls */
-    static unsigned int currentDb = 0;
-
-    /* Tracks the count of fields actively expired for the current database.
-     * This count continues as long as it fails to actively expire all expired
-     * fields of currentDb, indicating a possible need to adjust the value of
-     * maxToExpire. */
-    static uint64_t activeExpirySequence = 0;
-    /* Threshold for adjusting maxToExpire */
-    const uint32_t EXPIRED_FIELDS_TH = 1000000;
-
-    redisDb *db = server.db + currentDb;
-
-    /* If db is empty, move to next db and return */
-    if (ebIsEmpty(db->hexpires)) {
-        activeExpirySequence = 0;
-        currentDb = (currentDb + 1) % server.dbnum;
-        return;
-    }
-
-    /* Maximum number of fields to actively expire on a single call */
-    uint32_t maxToExpire = HFE_DB_BASE_ACTIVE_EXPIRE_FIELDS_PER_SEC / server.hz;
-
-    /* If running for a while and didn't manage to active-expire all expired fields of
-     * currentDb (i.e. activeExpirySequence becomes significant) then adjust maxToExpire */
-    if ((activeExpirySequence > EXPIRED_FIELDS_TH) && (type == ACTIVE_EXPIRE_CYCLE_SLOW)) {
-        /* maxToExpire is multiplied by a factor between 1 and 32, proportional to
-         * the number of times activeExpirySequence exceeded EXPIRED_FIELDS_TH */
-        uint64_t factor = activeExpirySequence / EXPIRED_FIELDS_TH;
-        maxToExpire *= (factor<32) ? factor : 32;
-    }
-
-    if (hashTypeDbActiveExpire(db, maxToExpire) == maxToExpire) {
-        /* active-expire reached maxToExpire limit */
-        activeExpirySequence += maxToExpire;
-    } else {
-        /* Managed to active-expire all expired fields of currentDb */
-        activeExpirySequence = 0;
-        currentDb = (currentDb + 1) % server.dbnum;
-    }
-}
-
 void activeExpireCycle(int type) {
     /* Adjust the running parameters according to the configured expire
      * effort. The default effort is 1, and the maximum configurable effort
@@ -206,13 +146,12 @@ void activeExpireCycle(int type) {
 
     int j, iteration = 0;
     int dbs_per_call = CRON_DBS_PER_CALL;
-    int dbs_performed = 0;
     long long start = ustime(), timelimit, elapsed;
 
-    /* If 'expire' action is paused, for whatever reason, then don't expire any key.
-     * Typically, at the end of the pause we will properly expire the key OR we
-     * will have failed over and the new primary will send us the expire. */
-    if (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)) return;
+    /* When clients are paused the dataset should be static not just from the
+     * POV of clients not being able to write, but also from the POV of
+     * expires and evictions of keys not being performed. */
+    if (checkClientPauseTimeoutAndReturnIfPaused()) return;
 
     if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
         /* Don't start a fast cycle if the previous cycle did not exit
@@ -256,58 +195,47 @@ void activeExpireCycle(int type) {
     long total_sampled = 0;
     long total_expired = 0;
 
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
-    serverAssert(server.also_propagate.numops == 0);
-
-    /* Stop iteration when one of the following conditions is met:
-     *
-     * 1) We have checked a sufficient number of databases with expiration time.
-     * 2) The time limit has been exceeded.
-     * 3) All databases have been traversed. */
-    for (j = 0; dbs_performed < dbs_per_call && timelimit_exit == 0 && j < server.dbnum; j++) {
-        /* Scan callback data including expired and checked count per iteration. */
-        expireScanData data;
-        data.ttl_sum = 0;
-        data.ttl_samples = 0;
+    for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
+        /* Expired and checked in a single loop. */
+        unsigned long expired, sampled;
 
         redisDb *db = server.db+(current_db % server.dbnum);
-        data.db = db;
-
-        int db_done = 0; /* The scan of the current DB is done? */
-        int update_avg_ttl_times = 0, repeat = 0;
 
         /* Increment the DB now so we are sure if we run out of time
          * in the current DB we'll restart from the next. This allows to
          * distribute the time evenly across DBs. */
         current_db++;
 
-        /* Interleaving hash-field expiration with key expiration. Better
-         * call it before handling expired keys because HFE DS is optimized for
-         * active expiration */
-        activeExpireHashFieldCycle(type);
-
-        if (kvstoreSize(db->expires))
-            dbs_performed++;
-
         /* Continue to expire if at the end of the cycle there are still
          * a big percentage of keys to expire, compared to the number of keys
          * we scanned. The percentage, stored in config_cycle_acceptable_stale
          * is not fixed, but depends on the Redis configured "expire effort". */
         do {
-            unsigned long num;
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
             iteration++;
 
             /* If there is nothing to expire try next DB ASAP. */
-            if ((num = kvstoreSize(db->expires)) == 0) {
+            if ((num = dictSize(db->expires)) == 0) {
                 db->avg_ttl = 0;
                 break;
             }
-            data.now = mstime();
+            slots = dictSlots(db->expires);
+            now = mstime();
 
-            /* The main collection cycle. Scan through keys among keys
+            /* When there are less than 1% filled slots, sampling the key
+             * space is expensive, so stop here waiting for better times...
+             * The dictionary will be resized asap. */
+            if (slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            /* The main collection cycle. Sample random keys among keys
              * with an expire set, checking for expired ones. */
-            data.sampled = 0;
-            data.expired = 0;
+            expired = 0;
+            sampled = 0;
+            ttl_sum = 0;
+            ttl_samples = 0;
 
             if (num > config_keys_per_loop)
                 num = config_keys_per_loop;
@@ -325,70 +253,66 @@ void activeExpireCycle(int type) {
             long max_buckets = num*20;
             long checked_buckets = 0;
 
-            int origin_ttl_samples = data.ttl_samples;
+            while (sampled < num && checked_buckets < max_buckets) {
+                for (int table = 0; table < 2; table++) {
+                    if (table == 1 && !dictIsRehashing(db->expires)) break;
 
-            while (data.sampled < num && checked_buckets < max_buckets) {
-                db->expires_cursor = kvstoreScan(db->expires, db->expires_cursor, -1, expireScanCallback, isExpiryDictValidForSamplingCb, &data);
-                if (db->expires_cursor == 0) {
-                    db_done = 1;
-                    break;
+                    unsigned long idx = db->expires_cursor;
+                    idx &= db->expires->ht[table].sizemask;
+                    dictEntry *de = db->expires->ht[table].table[idx];
+                    long long ttl;
+
+                    /* Scan the current bucket of the current table. */
+                    checked_buckets++;
+                    while(de) {
+                        /* Get the next entry now since this entry may get
+                         * deleted. */
+                        dictEntry *e = de;
+                        de = de->next;
+
+                        ttl = dictGetSignedIntegerVal(e)-now;
+                        if (activeExpireCycleTryExpire(db,e,now)) expired++;
+                        if (ttl > 0) {
+                            /* We want the average TTL of keys yet
+                             * not expired. */
+                            ttl_sum += ttl;
+                            ttl_samples++;
+                        }
+                        sampled++;
+                    }
                 }
-                checked_buckets++;
+                db->expires_cursor++;
             }
-            total_expired += data.expired;
-            total_sampled += data.sampled;
+            total_expired += expired;
+            total_sampled += sampled;
 
-            /* If find keys with ttl not yet expired, we need to update the average TTL stats once. */
-            if (data.ttl_samples - origin_ttl_samples > 0) update_avg_ttl_times++;
+            /* Update the average TTL stats for this database. */
+            if (ttl_samples) {
+                long long avg_ttl = ttl_sum/ttl_samples;
 
-            /* We don't repeat the cycle for the current database if the db is done
-             * for scanning or an acceptable number of stale keys (logically expired
-             * but yet not reclaimed). */
-            repeat = db_done ? 0 : (data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale);
+                /* Do a simple running average with a few samples.
+                 * We just use the current estimate with a weight of 2%
+                 * and the previous estimate with a weight of 98%. */
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
+            }
 
             /* We can't block forever here even if there are many keys to
-             * expire. So after a given amount of microseconds return to the
+             * expire. So after a given amount of milliseconds return to the
              * caller waiting for the other active expire cycle. */
-            if ((iteration & 0xf) == 0 || !repeat) { /* Update the average TTL stats every 16 iterations or about to exit. */
-                /* Update the average TTL stats for this database, 
-                 * because this may reach the time limit. */
-                if (data.ttl_samples) {
-                    long long avg_ttl = data.ttl_sum / data.ttl_samples;
-
-                    /* Do a simple running average with a few samples.
-                     * We just use the current estimate with a weight of 2%
-                     * and the previous estimate with a weight of 98%. */
-                    if (db->avg_ttl == 0) {
-                        db->avg_ttl = avg_ttl;
-                    } else {
-                        /* The origin code is as follow.
-                         * for (int i = 0; i < update_avg_ttl_times; i++) {
-                         *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
-                         * } 
-                         * We can convert the loop into a sum of a geometric progression.
-                         * db->avg_ttl = db->avg_ttl * pow(0.98, update_avg_ttl_times) + 
-                         *                  avg_ttl / 50 * (pow(0.98, update_avg_ttl_times - 1) + ... + 1) 
-                         *             = db->avg_ttl * pow(0.98, update_avg_ttl_times) + 
-                         *                  avg_ttl * (1 - pow(0.98, update_avg_ttl_times))
-                         *             = avg_ttl +  (db->avg_ttl - avg_ttl) * pow(0.98, update_avg_ttl_times) 
-                         * Notice that update_avg_ttl_times is between 1 and 16, we use a constant table 
-                         * to accelerate the calculation of pow(0.98, update_avg_ttl_times).*/
-                        db->avg_ttl = avg_ttl + (db->avg_ttl - avg_ttl) * avg_ttl_factor[update_avg_ttl_times - 1] ;
-                    }
-                    update_avg_ttl_times = 0;
-                    data.ttl_sum = 0;
-                    data.ttl_samples = 0;
-                }
-                if ((iteration & 0xf) == 0) { /* check time limit every 16 iterations. */
-                    elapsed = ustime()-start;
-                    if (elapsed > timelimit) {
-                        timelimit_exit = 1;
-                        server.stat_expired_time_cap_reached_count++;
-                        break;
-                    }
+            if ((iteration & 0xf) == 0) { /* check once every 16 iterations. */
+                elapsed = ustime()-start;
+                if (elapsed > timelimit) {
+                    timelimit_exit = 1;
+                    server.stat_expired_time_cap_reached_count++;
+                    break;
                 }
             }
-        } while (repeat);
+            /* We don't repeat the cycle for the current database if there are
+             * an acceptable amount of stale keys (logically expired but yet
+             * not reclaimed). */
+        } while (sampled == 0 ||
+                 (expired*100/sampled) > config_cycle_acceptable_stale);
     }
 
     elapsed = ustime()-start;
@@ -463,8 +387,14 @@ void expireSlaveKeys(void) {
         while(dbids && dbid < server.dbnum) {
             if ((dbids & 1) != 0) {
                 redisDb *db = server.db+dbid;
-                dictEntry *expire = dbFindExpires(db, keyname);
-                int expired = expire && activeExpireCycleTryExpire(server.db+dbid,expire,start);
+                dictEntry *expire = dictFind(db->expires,keyname);
+                int expired = 0;
+
+                if (expire &&
+                    activeExpireCycleTryExpire(server.db+dbid,expire,start))
+                {
+                    expired = 1;
+                }
 
                 /* If the key was not expired in this DB, we need to set the
                  * corresponding bit in the new bitmap we set as value.
@@ -509,7 +439,7 @@ void rememberSlaveKeyWithExpire(redisDb *db, robj *key) {
             NULL,                       /* val destructor */
             NULL                        /* allow to expand */
         };
-        slaveKeysWithExpire = dictCreate(&dt);
+        slaveKeysWithExpire = dictCreate(&dt,NULL);
     }
     if (db->id > 63) return;
 
@@ -518,8 +448,8 @@ void rememberSlaveKeyWithExpire(redisDb *db, robj *key) {
      * representing the key: we don't want to need to take those keys
      * in sync with the main DB. The keys will be removed by expireSlaveKeys()
      * as it scans to find keys to remove. */
-    if (dictGetKey(de) == key->ptr) {
-        dictSetKey(slaveKeysWithExpire, de, sdsdup(key->ptr));
+    if (de->key == key->ptr) {
+        de->key = sdsdup(key->ptr);
         dictSetUnsignedIntegerVal(de,0);
     }
 
@@ -556,57 +486,7 @@ int checkAlreadyExpired(long long when) {
      *
      * Instead we add the already expired key to the database with expire time
      * (possibly in the past) and wait for an explicit DEL from the master. */
-    return (when <= commandTimeSnapshot() && !server.loading && !server.masterhost);
-}
-
-#define EXPIRE_NX (1<<0)
-#define EXPIRE_XX (1<<1)
-#define EXPIRE_GT (1<<2)
-#define EXPIRE_LT (1<<3)
-
-/* Parse additional flags of expire commands
- *
- * Supported flags:
- * - NX: set expiry only when the key has no expiry
- * - XX: set expiry only when the key has an existing expiry
- * - GT: set expiry only when the new expiry is greater than current one
- * - LT: set expiry only when the new expiry is less than current one */
-int parseExtendedExpireArgumentsOrReply(client *c, int *flags) {
-    int nx = 0, xx = 0, gt = 0, lt = 0;
-
-    int j = 3;
-    while (j < c->argc) {
-        char *opt = c->argv[j]->ptr;
-        if (!strcasecmp(opt,"nx")) {
-            *flags |= EXPIRE_NX;
-            nx = 1;
-        } else if (!strcasecmp(opt,"xx")) {
-            *flags |= EXPIRE_XX;
-            xx = 1;
-        } else if (!strcasecmp(opt,"gt")) {
-            *flags |= EXPIRE_GT;
-            gt = 1;
-        } else if (!strcasecmp(opt,"lt")) {
-            *flags |= EXPIRE_LT;
-            lt = 1;
-        } else {
-            addReplyErrorFormat(c, "Unsupported option %s", opt);
-            return C_ERR;
-        }
-        j++;
-    }
-
-    if ((nx && xx) || (nx && gt) || (nx && lt)) {
-        addReplyError(c, "NX and XX, GT or LT options at the same time are not compatible");
-        return C_ERR;
-    }
-
-    if (gt && lt) {
-        addReplyError(c, "GT and LT options at the same time are not compatible");
-        return C_ERR;
-    }
-
-    return C_OK;
+    return (when <= mstime() && !server.loading && !server.masterhost);
 }
 
 /*-----------------------------------------------------------------------------
@@ -619,93 +499,33 @@ int parseExtendedExpireArgumentsOrReply(client *c, int *flags) {
  * for *AT variants of the command, or the current time for relative expires).
  *
  * unit is either UNIT_SECONDS or UNIT_MILLISECONDS, and is only used for
- * the argv[2] parameter. The basetime is always specified in milliseconds.
- *
- * Additional flags are supported and parsed via parseExtendedExpireArguments */
+ * the argv[2] parameter. The basetime is always specified in milliseconds. */
 void expireGenericCommand(client *c, long long basetime, int unit) {
     robj *key = c->argv[1], *param = c->argv[2];
     long long when; /* unix time in milliseconds when the key will expire. */
-    long long current_expire = -1;
-    int flag = 0;
-
-    /* checking optional flags */
-    if (parseExtendedExpireArgumentsOrReply(c, &flag) != C_OK) {
-        return;
-    }
 
     if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
         return;
-
-    /* EXPIRE allows negative numbers, but we can at least detect an
-     * overflow by either unit conversion or basetime addition. */
-    if (unit == UNIT_SECONDS) {
-        if (when > LLONG_MAX / 1000 || when < LLONG_MIN / 1000) {
-            addReplyErrorExpireTime(c);
-            return;
-        }
-        when *= 1000;
-    }
-
-    if (when > LLONG_MAX - basetime) {
-        addReplyErrorExpireTime(c);
+    int negative_when = when < 0;
+    if (unit == UNIT_SECONDS) when *= 1000;
+    when += basetime;
+    if (((when < 0) && !negative_when) || ((when-basetime > 0) && negative_when)) {
+        /* EXPIRE allows negative numbers, but we can at least detect an
+         * overflow by either unit conversion or basetime addition. */
+        addReplyErrorFormat(c, "invalid expire time in %s", c->cmd->name);
         return;
     }
-    when += basetime;
-
     /* No key, return zero. */
     if (lookupKeyWrite(c->db,key) == NULL) {
         addReply(c,shared.czero);
         return;
     }
 
-    if (flag) {
-        current_expire = getExpire(c->db, key);
-
-        /* NX option is set, check current expiry */
-        if (flag & EXPIRE_NX) {
-            if (current_expire != -1) {
-                addReply(c,shared.czero);
-                return;
-            }
-        }
-
-        /* XX option is set, check current expiry */
-        if (flag & EXPIRE_XX) {
-            if (current_expire == -1) {
-                /* reply 0 when the key has no expiry */
-                addReply(c,shared.czero);
-                return;
-            }
-        }
-
-        /* GT option is set, check current expiry */
-        if (flag & EXPIRE_GT) {
-            /* When current_expire is -1, we consider it as infinite TTL,
-             * so expire command with gt always fail the GT. */
-            if (when <= current_expire || current_expire == -1) {
-                /* reply 0 when the new expiry is not greater than current */
-                addReply(c,shared.czero);
-                return;
-            }
-        }
-
-        /* LT option is set, check current expiry */
-        if (flag & EXPIRE_LT) {
-            /* When current_expire -1, we consider it as infinite TTL,
-             * but 'when' can still be negative at this point, so if there is
-             * an expiry on the key and it's not less than current, we fail the LT. */
-            if (current_expire != -1 && when >= current_expire) {
-                /* reply 0 when the new expiry is not less than current */
-                addReply(c,shared.czero);
-                return;
-            }
-        }
-    }
-
     if (checkAlreadyExpired(when)) {
         robj *aux;
 
-        int deleted = dbGenericDelete(c->db,key,server.lazyfree_lazy_expire,DB_FLAG_KEY_EXPIRED);
+        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
+                                                    dbSyncDelete(c->db,key);
         serverAssertWithInfo(c,key,deleted);
         server.dirty++;
 
@@ -719,19 +539,6 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     } else {
         setExpire(c,c->db,key,when);
         addReply(c,shared.cone);
-        /* Propagate as PEXPIREAT millisecond-timestamp
-         * Only rewrite the command arg if not already PEXPIREAT */
-        if (c->cmd->proc != pexpireatCommand) {
-            rewriteClientCommandArgument(c,0,shared.pexpireat);
-        }
-
-        /* Avoid creating a string object when it's the same as argv[2] parameter  */
-        if (basetime != 0 || unit == UNIT_SECONDS) {
-            robj *when_obj = createStringObjectFromLongLong(when);
-            rewriteClientCommandArgument(c,2,when_obj);
-            decrRefCount(when_obj);
-        }
-
         signalModifiedKey(c,c->db,key);
         notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
         server.dirty++;
@@ -739,28 +546,28 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     }
 }
 
-/* EXPIRE key seconds [ NX | XX | GT | LT] */
+/* EXPIRE key seconds */
 void expireCommand(client *c) {
-    expireGenericCommand(c,commandTimeSnapshot(),UNIT_SECONDS);
+    expireGenericCommand(c,mstime(),UNIT_SECONDS);
 }
 
-/* EXPIREAT key unix-time-seconds [ NX | XX | GT | LT] */
+/* EXPIREAT key time */
 void expireatCommand(client *c) {
     expireGenericCommand(c,0,UNIT_SECONDS);
 }
 
-/* PEXPIRE key milliseconds [ NX | XX | GT | LT] */
+/* PEXPIRE key milliseconds */
 void pexpireCommand(client *c) {
-    expireGenericCommand(c,commandTimeSnapshot(),UNIT_MILLISECONDS);
+    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
 }
 
-/* PEXPIREAT key unix-time-milliseconds [ NX | XX | GT | LT] */
+/* PEXPIREAT key ms_time */
 void pexpireatCommand(client *c) {
     expireGenericCommand(c,0,UNIT_MILLISECONDS);
 }
 
-/* Implements TTL, PTTL, EXPIRETIME and PEXPIRETIME */
-void ttlGenericCommand(client *c, int output_ms, int output_abs) {
+/* Implements TTL and PTTL */
+void ttlGenericCommand(client *c, int output_ms) {
     long long expire, ttl = -1;
 
     /* If the key does not exist at all, return -2 */
@@ -768,12 +575,11 @@ void ttlGenericCommand(client *c, int output_ms, int output_abs) {
         addReplyLongLong(c,-2);
         return;
     }
-
     /* The key exists. Return -1 if it has no expire, or the actual
      * TTL value otherwise. */
     expire = getExpire(c->db,c->argv[1]);
     if (expire != -1) {
-        ttl = output_abs ? expire : expire-commandTimeSnapshot();
+        ttl = expire-mstime();
         if (ttl < 0) ttl = 0;
     }
     if (ttl == -1) {
@@ -785,22 +591,12 @@ void ttlGenericCommand(client *c, int output_ms, int output_abs) {
 
 /* TTL key */
 void ttlCommand(client *c) {
-    ttlGenericCommand(c, 0, 0);
+    ttlGenericCommand(c, 0);
 }
 
 /* PTTL key */
 void pttlCommand(client *c) {
-    ttlGenericCommand(c, 1, 0);
-}
-
-/* EXPIRETIME key */
-void expiretimeCommand(client *c) {
-    ttlGenericCommand(c, 0, 1);
-}
-
-/* PEXPIRETIME key */
-void pexpiretimeCommand(client *c) {
-    ttlGenericCommand(c, 1, 1);
+    ttlGenericCommand(c, 1);
 }
 
 /* PERSIST key */
@@ -826,3 +622,4 @@ void touchCommand(client *c) {
         if (lookupKeyRead(c->db,c->argv[j]) != NULL) touched++;
     addReplyLongLong(c,touched);
 }
+

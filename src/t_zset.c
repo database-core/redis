@@ -1,15 +1,31 @@
-/* t_zset.c -- zset data type implementation.
- *
- * Copyright (c) 2009-Present, Redis Ltd.
+/*
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * All rights reserved.
  *
- * Copyright (c) 2024-present, Valkey contributors.
- * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
  *
- * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 /*-----------------------------------------------------------------------------
@@ -39,9 +55,8 @@
  * c) there is a back pointer, so it's a doubly linked list with the back
  * pointers being only at "level 1". This allows to traverse the list
  * from tail to head, useful for ZREVRANGE. */
-#include "fast_float_strtod.h"
+
 #include "server.h"
-#include "intset.h"  /* Compact integer set structure */
 #include <math.h>
 
 /*-----------------------------------------------------------------------------
@@ -50,9 +65,6 @@
 
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
-void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap);
-zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int start_level, unsigned long rank);
-zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
 /* Create a skiplist node with the specified number of levels.
  * The SDS string 'ele' is referenced by the node after the call. */
@@ -108,9 +120,8 @@ void zslFree(zskiplist *zsl) {
  * (both inclusive), with a powerlaw-alike distribution where higher
  * levels are less likely to be returned. */
 int zslRandomLevel(void) {
-    static const int threshold = ZSKIPLIST_P*RAND_MAX;
     int level = 1;
-    while (random() < threshold)
+    while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
         level += 1;
     return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
 }
@@ -120,7 +131,7 @@ int zslRandomLevel(void) {
  * of the passed SDS string 'ele'. */
 zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
-    unsigned long rank[ZSKIPLIST_MAXLEVEL];
+    unsigned int rank[ZSKIPLIST_MAXLEVEL];
     int i, level;
 
     serverAssert(!isnan(score));
@@ -314,82 +325,54 @@ int zslIsInRange(zskiplist *zsl, zrangespec *range) {
     return 1;
 }
 
-/* Find the Nth node that is contained in the specified range. N should be 0-based.
- * Negative N works for reversed order (-1 represents the last element). Returns
- * NULL when no element is contained in the range. */
-zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n) {
+/* Find the first node that is contained in the specified range.
+ * Returns NULL when no element is contained in the range. */
+zskiplistNode *zslFirstInRange(zskiplist *zsl, zrangespec *range) {
     zskiplistNode *x;
     int i;
-    long edge_rank = 0;
-    long last_highest_level_rank = 0;
-    zskiplistNode *last_highest_level_node = NULL;
-    unsigned long rank_diff;
 
     /* If everything is out of range, return early. */
     if (!zslIsInRange(zsl,range)) return NULL;
 
-    /* Go forward while *OUT* of range at level of zsl->level-1. */
     x = zsl->header;
-    i = zsl->level - 1;
-    while (x->level[i].forward && !zslValueGteMin(x->level[i].forward->score, range)) {
-        edge_rank += x->level[i].span;
-        x = x->level[i].forward;
-    }
-    /* Remember the last node which has zsl->level-1 levels and its rank. */
-    last_highest_level_node = x;
-    last_highest_level_rank = edge_rank;
-
-    if (n >= 0) {
-        for (i = zsl->level - 2; i >= 0; i--) {
-            /* Go forward while *OUT* of range. */
-            while (x->level[i].forward && !zslValueGteMin(x->level[i].forward->score, range)) {
-                /* Count the rank of the last element smaller than the range. */
-                edge_rank += x->level[i].span;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* Go forward while *OUT* of range. */
+        while (x->level[i].forward &&
+            !zslValueGteMin(x->level[i].forward->score,range))
                 x = x->level[i].forward;
-            }
-        }
-        /* Check if zsl is long enough. */
-        if ((unsigned long)(edge_rank + n) >= zsl->length) return NULL;
-        if (n < ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank+1 is the first element in range, so we need n+1 steps to reach target. */
-            for (i = 0; i < n + 1; i++) { 
-                x = x->level[0].forward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score <= max. */
-        if (x && !zslValueLteMax(x->score,range)) return NULL;
-    } else  {
-        for (i = zsl->level - 1; i >= 0; i--) {
-            /* Go forward while *IN* range. */
-            while (x->level[i].forward && zslValueLteMax(x->level[i].forward->score, range)) {
-                /* Count the rank of the last element in range. */
-                edge_rank += x->level[i].span;
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if the range is big enough. */
-        if (edge_rank < -n) return NULL;
-        if (n + 1 > -ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank is the -1th element in range, so we need -n-1 steps to reach target. */
-            for (i = 0; i < -n - 1; i++) {
-                x = x->backward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            /* rank is the last element in range, n is -1-based, so we need n+1 to count backwards. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score >= min. */
-        if (x && !zslValueGteMin(x->score, range)) return NULL;
     }
 
+    /* This is an inner range, so the next node cannot be NULL. */
+    x = x->level[0].forward;
+    serverAssert(x != NULL);
+
+    /* Check if score <= max. */
+    if (!zslValueLteMax(x->score,range)) return NULL;
+    return x;
+}
+
+/* Find the last node that is contained in the specified range.
+ * Returns NULL when no element is contained in the range. */
+zskiplistNode *zslLastInRange(zskiplist *zsl, zrangespec *range) {
+    zskiplistNode *x;
+    int i;
+
+    /* If everything is out of range, return early. */
+    if (!zslIsInRange(zsl,range)) return NULL;
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* Go forward while *IN* range. */
+        while (x->level[i].forward &&
+            zslValueLteMax(x->level[i].forward->score,range))
+                x = x->level[i].forward;
+    }
+
+    /* This is an inner range, so this node cannot be NULL. */
+    serverAssert(x != NULL);
+
+    /* Check if score >= min. */
+    if (!zslValueGteMin(x->score,range)) return NULL;
     return x;
 }
 
@@ -405,8 +388,9 @@ unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dic
 
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
-        while (x->level[i].forward &&
-            !zslValueGteMin(x->level[i].forward->score, range))
+        while (x->level[i].forward && (range->minex ?
+            x->level[i].forward->score <= range->min :
+            x->level[i].forward->score < range->min))
                 x = x->level[i].forward;
         update[i] = x;
     }
@@ -415,7 +399,9 @@ unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dic
     x = x->level[0].forward;
 
     /* Delete nodes while in range. */
-    while (x && zslValueLteMax(x->score, range)) {
+    while (x &&
+           (range->maxex ? x->score < range->max : x->score <= range->max))
+    {
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl,x,update);
         dictDelete(dict,x->ele);
@@ -505,21 +491,21 @@ unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
         }
 
         /* x might be equal to zsl->header, so test if obj is non-NULL */
-        if (x->ele && x->score == score && sdscmp(x->ele,ele) == 0) {
+        if (x->ele && sdscmp(x->ele,ele) == 0) {
             return rank;
         }
     }
     return 0;
 }
 
-/* Finds an element by its rank from start node. The rank argument needs to be 1-based. */
-zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int start_level, unsigned long rank) {
+/* Finds an element by its rank. The rank argument needs to be 1-based. */
+zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank) {
     zskiplistNode *x;
     unsigned long traversed = 0;
     int i;
 
-    x = start_node;
-    for (i = start_level; i >= 0; i--) {
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
         while (x->level[i].forward && (traversed + x->level[i].span) <= rank)
         {
             traversed += x->level[i].span;
@@ -530,11 +516,6 @@ zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int start_
         }
     }
     return NULL;
-}
-
-/* Finds an element by its rank. The rank argument needs to be 1-based. */
-zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank) {
-    return zslGetElementByRankFromNode(zsl->header, zsl->level - 1, rank);
 }
 
 /* Populate the rangespec according to the objects min and max. */
@@ -550,11 +531,11 @@ static int zslParseRange(robj *min, robj *max, zrangespec *spec) {
         spec->min = (long)min->ptr;
     } else {
         if (((char*)min->ptr)[0] == '(') {
-            spec->min = fast_float_strtod((char*)min->ptr+1,&eptr);
+            spec->min = strtod((char*)min->ptr+1,&eptr);
             if (eptr[0] != '\0' || isnan(spec->min)) return C_ERR;
             spec->minex = 1;
         } else {
-            spec->min = fast_float_strtod((char*)min->ptr,&eptr);
+            spec->min = strtod((char*)min->ptr,&eptr);
             if (eptr[0] != '\0' || isnan(spec->min)) return C_ERR;
         }
     }
@@ -562,11 +543,11 @@ static int zslParseRange(robj *min, robj *max, zrangespec *spec) {
         spec->max = (long)max->ptr;
     } else {
         if (((char*)max->ptr)[0] == '(') {
-            spec->max = fast_float_strtod((char*)max->ptr+1,&eptr);
+            spec->max = strtod((char*)max->ptr+1,&eptr);
             if (eptr[0] != '\0' || isnan(spec->max)) return C_ERR;
             spec->maxex = 1;
         } else {
-            spec->max = fast_float_strtod((char*)max->ptr,&eptr);
+            spec->max = strtod((char*)max->ptr,&eptr);
             if (eptr[0] != '\0' || isnan(spec->max)) return C_ERR;
         }
     }
@@ -616,7 +597,7 @@ int zslParseLexRangeItem(robj *item, sds *dest, int *ex) {
     }
 }
 
-/* Free a lex range structure, must be called only after zslParseLexRange()
+/* Free a lex range structure, must be called only after zelParseLexRange()
  * populated the structure with success (C_OK returned). */
 void zslFreeLexRange(zlexrangespec *spec) {
     if (spec->min != shared.minstring &&
@@ -685,95 +666,68 @@ int zslIsInLexRange(zskiplist *zsl, zlexrangespec *range) {
     return 1;
 }
 
-/* Find the Nth node that is contained in the specified range. N should be 0-based.
- * Negative N works for reversed order (-1 represents the last element). Returns
- * NULL when no element is contained in the range. */
-zskiplistNode *zslNthInLexRange(zskiplist *zsl, zlexrangespec *range, long n) {
+/* Find the first node that is contained in the specified lex range.
+ * Returns NULL when no element is contained in the range. */
+zskiplistNode *zslFirstInLexRange(zskiplist *zsl, zlexrangespec *range) {
     zskiplistNode *x;
     int i;
-    long edge_rank = 0;
-    long last_highest_level_rank = 0;
-    zskiplistNode *last_highest_level_node = NULL;
-    unsigned long rank_diff;
 
     /* If everything is out of range, return early. */
     if (!zslIsInLexRange(zsl,range)) return NULL;
 
-    /* Go forward while *OUT* of range at level of zsl->level-1. */
     x = zsl->header;
-    i = zsl->level - 1;
-    while (x->level[i].forward && !zslLexValueGteMin(x->level[i].forward->ele, range)) {
-        edge_rank += x->level[i].span;
-        x = x->level[i].forward;
-    }
-    /* Remember the last node which has zsl->level-1 levels and its rank. */
-    last_highest_level_node = x;
-    last_highest_level_rank = edge_rank;
-
-    if (n >= 0) {
-        for (i = zsl->level - 2; i >= 0; i--) {
-            /* Go forward while *OUT* of range. */
-            while (x->level[i].forward && !zslLexValueGteMin(x->level[i].forward->ele, range)) {
-                /* Count the rank of the last element smaller than the range. */
-                edge_rank += x->level[i].span;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* Go forward while *OUT* of range. */
+        while (x->level[i].forward &&
+            !zslLexValueGteMin(x->level[i].forward->ele,range))
                 x = x->level[i].forward;
-            }
-        }
-        /* Check if zsl is long enough. */
-        if ((unsigned long)(edge_rank + n) >= zsl->length) return NULL; 
-        if (n < ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            /* rank+1 is the first element in range, so we need n+1 steps to reach target. */
-            for (i = 0; i < n + 1; i++) { 
-                x = x->level[0].forward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score <= max. */
-        if (x && !zslLexValueLteMax(x->ele,range)) return NULL;
-    } else {
-        for (i = zsl->level - 1; i >= 0; i--) {
-            /* Go forward while *IN* range. */
-            while (x->level[i].forward && zslLexValueLteMax(x->level[i].forward->ele, range)) {
-                /* Count the rank of the last element in range. */
-                edge_rank += x->level[i].span;
-                x = x->level[i].forward;
-            }
-        }
-        /* Check if the range is big enough. */
-        if (edge_rank < -n) return NULL;
-        if (n + 1 > -ZSKIPLIST_MAX_SEARCH) {
-            /* If offset is small, we can just jump node by node */
-            for (i = 0; i < -n - 1; i++) {
-                x = x->backward;
-            }
-        } else {
-            /* If offset is big, we can jump from the last zsl->level-1 node. */
-            /* rank is the last element in range, n is -1-based, so we need n+1 to count backwards. */
-            rank_diff = edge_rank + 1 + n - last_highest_level_rank;
-            x = zslGetElementByRankFromNode(last_highest_level_node, zsl->level - 1, rank_diff);
-        }
-        /* Check if score >= min. */
-        if (x && !zslLexValueGteMin(x->ele, range)) return NULL;
     }
 
+    /* This is an inner range, so the next node cannot be NULL. */
+    x = x->level[0].forward;
+    serverAssert(x != NULL);
+
+    /* Check if score <= max. */
+    if (!zslLexValueLteMax(x->ele,range)) return NULL;
+    return x;
+}
+
+/* Find the last node that is contained in the specified range.
+ * Returns NULL when no element is contained in the range. */
+zskiplistNode *zslLastInLexRange(zskiplist *zsl, zlexrangespec *range) {
+    zskiplistNode *x;
+    int i;
+
+    /* If everything is out of range, return early. */
+    if (!zslIsInLexRange(zsl,range)) return NULL;
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* Go forward while *IN* range. */
+        while (x->level[i].forward &&
+            zslLexValueLteMax(x->level[i].forward->ele,range))
+                x = x->level[i].forward;
+    }
+
+    /* This is an inner range, so this node cannot be NULL. */
+    serverAssert(x != NULL);
+
+    /* Check if score >= min. */
+    if (!zslLexValueGteMin(x->ele,range)) return NULL;
     return x;
 }
 
 /*-----------------------------------------------------------------------------
- * Listpack-backed sorted set API
+ * Ziplist-backed sorted set API
  *----------------------------------------------------------------------------*/
 
 double zzlStrtod(unsigned char *vstr, unsigned int vlen) {
     char buf[128];
-    if (vlen > sizeof(buf) - 1)
-        vlen = sizeof(buf) - 1;
+    if (vlen > sizeof(buf))
+        vlen = sizeof(buf);
     memcpy(buf,vstr,vlen);
     buf[vlen] = '\0';
-    return fast_float_strtod(buf,NULL);
+    return strtod(buf,NULL);
  }
 
 double zzlGetScore(unsigned char *sptr) {
@@ -783,7 +737,7 @@ double zzlGetScore(unsigned char *sptr) {
     double score;
 
     serverAssert(sptr != NULL);
-    vstr = lpGetValue(sptr,&vlen,&vlong);
+    serverAssert(ziplistGet(sptr,&vstr,&vlen,&vlong));
 
     if (vstr) {
         score = zzlStrtod(vstr,vlen);
@@ -794,14 +748,14 @@ double zzlGetScore(unsigned char *sptr) {
     return score;
 }
 
-/* Return a listpack element as an SDS string. */
-sds lpGetObject(unsigned char *sptr) {
+/* Return a ziplist element as an SDS string. */
+sds ziplistGetObject(unsigned char *sptr) {
     unsigned char *vstr;
     unsigned int vlen;
     long long vlong;
 
     serverAssert(sptr != NULL);
-    vstr = lpGetValue(sptr,&vlen,&vlong);
+    serverAssert(ziplistGet(sptr,&vstr,&vlen,&vlong));
 
     if (vstr) {
         return sdsnewlen((char*)vstr,vlen);
@@ -818,7 +772,7 @@ int zzlCompareElements(unsigned char *eptr, unsigned char *cstr, unsigned int cl
     unsigned char vbuf[32];
     int minlen, cmp;
 
-    vstr = lpGetValue(eptr,&vlen,&vlong);
+    serverAssert(ziplistGet(eptr,&vstr,&vlen,&vlong));
     if (vstr == NULL) {
         /* Store string representation of long long in buf. */
         vlen = ll2string((char*)vbuf,sizeof(vbuf),vlong);
@@ -832,7 +786,7 @@ int zzlCompareElements(unsigned char *eptr, unsigned char *cstr, unsigned int cl
 }
 
 unsigned int zzlLength(unsigned char *zl) {
-    return lpLength(zl)/2;
+    return ziplistLen(zl)/2;
 }
 
 /* Move to next entry based on the values in eptr and sptr. Both are set to
@@ -841,9 +795,9 @@ void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
     unsigned char *_eptr, *_sptr;
     serverAssert(*eptr != NULL && *sptr != NULL);
 
-    _eptr = lpNext(zl,*sptr);
+    _eptr = ziplistNext(zl,*sptr);
     if (_eptr != NULL) {
-        _sptr = lpNext(zl,_eptr);
+        _sptr = ziplistNext(zl,_eptr);
         serverAssert(_sptr != NULL);
     } else {
         /* No next entry. */
@@ -855,14 +809,14 @@ void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
 }
 
 /* Move to the previous entry based on the values in eptr and sptr. Both are
- * set to NULL when there is no prev entry. */
+ * set to NULL when there is no next entry. */
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
     unsigned char *_eptr, *_sptr;
     serverAssert(*eptr != NULL && *sptr != NULL);
 
-    _sptr = lpPrev(zl,*eptr);
+    _sptr = ziplistPrev(zl,*eptr);
     if (_sptr != NULL) {
-        _eptr = lpPrev(zl,_sptr);
+        _eptr = ziplistPrev(zl,_sptr);
         serverAssert(_eptr != NULL);
     } else {
         /* No previous entry. */
@@ -884,13 +838,13 @@ int zzlIsInRange(unsigned char *zl, zrangespec *range) {
             (range->min == range->max && (range->minex || range->maxex)))
         return 0;
 
-    p = lpSeek(zl,-1); /* Last score. */
+    p = ziplistIndex(zl,-1); /* Last score. */
     if (p == NULL) return 0; /* Empty sorted set */
     score = zzlGetScore(p);
     if (!zslValueGteMin(score,range))
         return 0;
 
-    p = lpSeek(zl,1); /* First score. */
+    p = ziplistIndex(zl,1); /* First score. */
     serverAssert(p != NULL);
     score = zzlGetScore(p);
     if (!zslValueLteMax(score,range))
@@ -902,14 +856,14 @@ int zzlIsInRange(unsigned char *zl, zrangespec *range) {
 /* Find pointer to the first element contained in the specified range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+    unsigned char *eptr = ziplistIndex(zl,0), *sptr;
     double score;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInRange(zl,range)) return NULL;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
 
         score = zzlGetScore(sptr);
@@ -921,7 +875,7 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
         }
 
         /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        eptr = ziplistNext(zl,sptr);
     }
 
     return NULL;
@@ -930,14 +884,14 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
 /* Find pointer to the last element contained in the specified range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,-2), *sptr;
+    unsigned char *eptr = ziplistIndex(zl,-2), *sptr;
     double score;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInRange(zl,range)) return NULL;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
 
         score = zzlGetScore(sptr);
@@ -950,9 +904,9 @@ unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
 
         /* Move to previous element by moving to the score of previous element.
          * When this returns NULL, we know there also is no element. */
-        sptr = lpPrev(zl,eptr);
+        sptr = ziplistPrev(zl,eptr);
         if (sptr != NULL)
-            serverAssert((eptr = lpPrev(zl,sptr)) != NULL);
+            serverAssert((eptr = ziplistPrev(zl,sptr)) != NULL);
         else
             eptr = NULL;
     }
@@ -961,21 +915,21 @@ unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
 }
 
 int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec) {
-    sds value = lpGetObject(p);
+    sds value = ziplistGetObject(p);
     int res = zslLexValueGteMin(value,spec);
     sdsfree(value);
     return res;
 }
 
 int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec) {
-    sds value = lpGetObject(p);
+    sds value = ziplistGetObject(p);
     int res = zslLexValueLteMax(value,spec);
     sdsfree(value);
     return res;
 }
 
 /* Returns if there is a part of the zset is in range. Should only be used
- * internally by zzlFirstInLexRange and zzlLastInLexRange. */
+ * internally by zzlFirstInRange and zzlLastInRange. */
 int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
     unsigned char *p;
 
@@ -984,12 +938,12 @@ int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
     if (cmp > 0 || (cmp == 0 && (range->minex || range->maxex)))
         return 0;
 
-    p = lpSeek(zl,-2); /* Last element. */
+    p = ziplistIndex(zl,-2); /* Last element. */
     if (p == NULL) return 0;
     if (!zzlLexValueGteMin(p,range))
         return 0;
 
-    p = lpSeek(zl,0); /* First element. */
+    p = ziplistIndex(zl,0); /* First element. */
     serverAssert(p != NULL);
     if (!zzlLexValueLteMax(p,range))
         return 0;
@@ -1000,7 +954,7 @@ int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
 /* Find pointer to the first element contained in the specified lex range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+    unsigned char *eptr = ziplistIndex(zl,0), *sptr;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInLexRange(zl,range)) return NULL;
@@ -1014,9 +968,9 @@ unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
         }
 
         /* Move to next element. */
-        sptr = lpNext(zl,eptr); /* This element score. Skip it. */
+        sptr = ziplistNext(zl,eptr); /* This element score. Skip it. */
         serverAssert(sptr != NULL);
-        eptr = lpNext(zl,sptr); /* Next element. */
+        eptr = ziplistNext(zl,sptr); /* Next element. */
     }
 
     return NULL;
@@ -1025,7 +979,7 @@ unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
 /* Find pointer to the last element contained in the specified lex range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,-2), *sptr;
+    unsigned char *eptr = ziplistIndex(zl,-2), *sptr;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInLexRange(zl,range)) return NULL;
@@ -1040,9 +994,9 @@ unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
 
         /* Move to previous element by moving to the score of previous element.
          * When this returns NULL, we know there also is no element. */
-        sptr = lpPrev(zl,eptr);
+        sptr = ziplistPrev(zl,eptr);
         if (sptr != NULL)
-            serverAssert((eptr = lpPrev(zl,sptr)) != NULL);
+            serverAssert((eptr = ziplistPrev(zl,sptr)) != NULL);
         else
             eptr = NULL;
     }
@@ -1050,64 +1004,67 @@ unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
     return NULL;
 }
 
-unsigned char *zzlFind(unsigned char *lp, sds ele, double *score) {
-    unsigned char *eptr, *sptr;
+unsigned char *zzlFind(unsigned char *zl, sds ele, double *score) {
+    unsigned char *eptr = ziplistIndex(zl,0), *sptr;
 
-    if ((eptr = lpFirst(lp)) == NULL) return NULL;
-    eptr = lpFind(lp, eptr, (unsigned char*)ele, sdslen(ele), 1);
-    if (eptr) {
-        sptr = lpNext(lp,eptr);
+    while (eptr != NULL) {
+        sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
 
-        /* Matching element, pull out score. */
-        if (score != NULL) *score = zzlGetScore(sptr);
-        return eptr;
-    }
+        if (ziplistCompare(eptr,(unsigned char*)ele,sdslen(ele))) {
+            /* Matching element, pull out score. */
+            if (score != NULL) *score = zzlGetScore(sptr);
+            return eptr;
+        }
 
+        /* Move to next element. */
+        eptr = ziplistNext(zl,sptr);
+    }
     return NULL;
 }
 
-/* Delete (element,score) pair from listpack. Use local copy of eptr because we
+/* Delete (element,score) pair from ziplist. Use local copy of eptr because we
  * don't want to modify the one given as argument. */
 unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
-    return lpDeleteRangeWithEntry(zl,&eptr,2);
+    unsigned char *p = eptr;
+
+    /* TODO: add function to ziplist API to delete N elements from offset. */
+    zl = ziplistDelete(zl,&p);
+    zl = ziplistDelete(zl,&p);
+    return zl;
 }
 
 unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) {
     unsigned char *sptr;
-    char scorebuf[MAX_D2STRING_CHARS];
-    int scorelen = 0;
-    long long lscore;
-    int score_is_long = double2ll(score, &lscore);
-    if (!score_is_long)
-        scorelen = d2string(scorebuf,sizeof(scorebuf),score);
-    if (eptr == NULL) {
-        zl = lpAppend(zl,(unsigned char*)ele,sdslen(ele));
-        if (score_is_long)
-            zl = lpAppendInteger(zl,lscore);
-        else
-            zl = lpAppend(zl,(unsigned char*)scorebuf,scorelen);
-    } else {
-        /* Insert member before the element 'eptr'. */
-        zl = lpInsertString(zl,(unsigned char*)ele,sdslen(ele),eptr,LP_BEFORE,&sptr);
+    char scorebuf[128];
+    int scorelen;
+    size_t offset;
 
-        /* Insert score after the member. */
-        if (score_is_long)
-            zl = lpInsertInteger(zl,lscore,sptr,LP_AFTER,NULL);
-        else
-            zl = lpInsertString(zl,(unsigned char*)scorebuf,scorelen,sptr,LP_AFTER,NULL);
+    scorelen = d2string(scorebuf,sizeof(scorebuf),score);
+    if (eptr == NULL) {
+        zl = ziplistPush(zl,(unsigned char*)ele,sdslen(ele),ZIPLIST_TAIL);
+        zl = ziplistPush(zl,(unsigned char*)scorebuf,scorelen,ZIPLIST_TAIL);
+    } else {
+        /* Keep offset relative to zl, as it might be re-allocated. */
+        offset = eptr-zl;
+        zl = ziplistInsert(zl,eptr,(unsigned char*)ele,sdslen(ele));
+        eptr = zl+offset;
+
+        /* Insert score after the element. */
+        serverAssert((sptr = ziplistNext(zl,eptr)) != NULL);
+        zl = ziplistInsert(zl,sptr,(unsigned char*)scorebuf,scorelen);
     }
     return zl;
 }
 
-/* Insert (element,score) pair in listpack. This function assumes the element is
+/* Insert (element,score) pair in ziplist. This function assumes the element is
  * not yet present in the list. */
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+    unsigned char *eptr = ziplistIndex(zl,0), *sptr;
     double s;
 
     while (eptr != NULL) {
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
         s = zzlGetScore(sptr);
 
@@ -1126,7 +1083,7 @@ unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
         }
 
         /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        eptr = ziplistNext(zl,sptr);
     }
 
     /* Push on tail of list when it was not yet inserted. */
@@ -1145,12 +1102,14 @@ unsigned char *zzlDeleteRangeByScore(unsigned char *zl, zrangespec *range, unsig
     eptr = zzlFirstInRange(zl,range);
     if (eptr == NULL) return zl;
 
-    /* When the tail of the listpack is deleted, eptr will be NULL. */
-    while (eptr && (sptr = lpNext(zl,eptr)) != NULL) {
+    /* When the tail of the ziplist is deleted, eptr will point to the sentinel
+     * byte and ziplistNext will return NULL. */
+    while ((sptr = ziplistNext(zl,eptr)) != NULL) {
         score = zzlGetScore(sptr);
         if (zslValueLteMax(score,range)) {
             /* Delete both the element and the score. */
-            zl = lpDeleteRangeWithEntry(zl,&eptr,2);
+            zl = ziplistDelete(zl,&eptr);
+            zl = ziplistDelete(zl,&eptr);
             num++;
         } else {
             /* No longer in range. */
@@ -1171,11 +1130,13 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
     eptr = zzlFirstInLexRange(zl,range);
     if (eptr == NULL) return zl;
 
-    /* When the tail of the listpack is deleted, eptr will be NULL. */
-    while (eptr && (sptr = lpNext(zl,eptr)) != NULL) {
+    /* When the tail of the ziplist is deleted, eptr will point to the sentinel
+     * byte and ziplistNext will return NULL. */
+    while ((sptr = ziplistNext(zl,eptr)) != NULL) {
         if (zzlLexValueLteMax(eptr,range)) {
             /* Delete both the element and the score. */
-            zl = lpDeleteRangeWithEntry(zl,&eptr,2);
+            zl = ziplistDelete(zl,&eptr);
+            zl = ziplistDelete(zl,&eptr);
             num++;
         } else {
             /* No longer in range. */
@@ -1192,7 +1153,7 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
 unsigned char *zzlDeleteRangeByRank(unsigned char *zl, unsigned int start, unsigned int end, unsigned long *deleted) {
     unsigned int num = (end-start)+1;
     if (deleted) *deleted = num;
-    zl = lpDeleteRange(zl,2*(start-1),2*num);
+    zl = ziplistDeleteRange(zl,2*(start-1),2*num);
     return zl;
 }
 
@@ -1202,7 +1163,7 @@ unsigned char *zzlDeleteRangeByRank(unsigned char *zl, unsigned int start, unsig
 
 unsigned long zsetLength(const robj *zobj) {
     unsigned long length = 0;
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         length = zzlLength(zobj->ptr);
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         length = ((const zset*)zobj->ptr)->zsl->length;
@@ -1212,53 +1173,14 @@ unsigned long zsetLength(const robj *zobj) {
     return length;
 }
 
-/* Factory method to return a zset.
- *
- * The size hint indicates approximately how many items will be added,
- * and the value len hint indicates the approximate individual size of the added elements,
- * they are used to determine the initial representation.
- *
- * If the hints are not known, and underestimation or 0 is suitable. 
- * We should never pass a negative value because it will convert to a very large unsigned number. */
-robj *zsetTypeCreate(size_t size_hint, size_t val_len_hint) {
-    if (size_hint <= server.zset_max_listpack_entries &&
-        val_len_hint <= server.zset_max_listpack_value)
-    {
-        return createZsetListpackObject();
-    }
-
-    robj *zobj = createZsetObject();
-    zset *zs = zobj->ptr;
-    dictExpand(zs->dict, size_hint);
-    return zobj;
-}
-
-/* Check if the existing zset should be converted to another encoding based off the
- * the size hint. */
-void zsetTypeMaybeConvert(robj *zobj, size_t size_hint) {
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK &&
-        size_hint > server.zset_max_listpack_entries)
-    {
-        zsetConvertAndExpand(zobj, OBJ_ENCODING_SKIPLIST, size_hint);
-    }
-}
-
-/* Convert the zset to specified encoding. The zset dict (when converting
- * to a skiplist) is presized to hold the number of elements in the original
- * zset. */
 void zsetConvert(robj *zobj, int encoding) {
-    zsetConvertAndExpand(zobj, encoding, zsetLength(zobj));
-}
-
-/* Converts a zset to the specified encoding, pre-sizing it for 'cap' elements. */
-void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
     zset *zs;
     zskiplistNode *node, *next;
     sds ele;
     double score;
 
     if (zobj->encoding == encoding) return;
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
@@ -1269,21 +1191,17 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
             serverPanic("Unknown target encoding");
 
         zs = zmalloc(sizeof(*zs));
-        zs->dict = dictCreate(&zsetDictType);
+        zs->dict = dictCreate(&zsetDictType,NULL);
         zs->zsl = zslCreate();
 
-        /* Presize the dict to avoid rehashing */
-        dictExpand(zs->dict, cap);
-
-        eptr = lpSeek(zl,0);
-        if (eptr != NULL) {
-            sptr = lpNext(zl,eptr);
-            serverAssertWithInfo(NULL,zobj,sptr != NULL);
-        }
+        eptr = ziplistIndex(zl,0);
+        serverAssertWithInfo(NULL,zobj,eptr != NULL);
+        sptr = ziplistNext(zl,eptr);
+        serverAssertWithInfo(NULL,zobj,sptr != NULL);
 
         while (eptr != NULL) {
             score = zzlGetScore(sptr);
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            serverAssertWithInfo(NULL,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
             else
@@ -1298,13 +1216,13 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zobj->ptr = zs;
         zobj->encoding = OBJ_ENCODING_SKIPLIST;
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
-        unsigned char *zl = lpNew(0);
+        unsigned char *zl = ziplistNew();
 
-        if (encoding != OBJ_ENCODING_LISTPACK)
+        if (encoding != OBJ_ENCODING_ZIPLIST)
             serverPanic("Unknown target encoding");
 
         /* Approach similar to zslFree(), since we want to free the skiplist at
-         * the same time as creating the listpack. */
+         * the same time as creating the ziplist. */
         zs = zobj->ptr;
         dictRelease(zs->dict);
         node = zs->zsl->header->level[0].forward;
@@ -1320,25 +1238,22 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         zfree(zs);
         zobj->ptr = zl;
-        zobj->encoding = OBJ_ENCODING_LISTPACK;
+        zobj->encoding = OBJ_ENCODING_ZIPLIST;
     } else {
         serverPanic("Unknown sorted set encoding");
     }
 }
 
-/* Convert the sorted set object into a listpack if it is not already a listpack
- * and if the number of elements and the maximum element size and total elements size
- * are within the expected ranges. */
-void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen) {
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) return;
+/* Convert the sorted set object into a ziplist if it is not already a ziplist
+ * and if the number of elements and the maximum element size is within the
+ * expected ranges. */
+void zsetConvertToZiplistIfNeeded(robj *zobj, size_t maxelelen) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) return;
     zset *zset = zobj->ptr;
 
-    if (zset->zsl->length <= server.zset_max_listpack_entries &&
-        maxelelen <= server.zset_max_listpack_value &&
-        lpSafeToAdd(NULL, totelelen))
-    {
-        zsetConvert(zobj,OBJ_ENCODING_LISTPACK);
-    }
+    if (zset->zsl->length <= server.zset_max_ziplist_entries &&
+        maxelelen <= server.zset_max_ziplist_value)
+            zsetConvert(zobj,OBJ_ENCODING_ZIPLIST);
 }
 
 /* Return (by reference) the score of the specified member of the sorted set
@@ -1348,7 +1263,7 @@ void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelele
 int zsetScore(robj *zobj, sds member, double *score) {
     if (!zobj || !member) return C_ERR;
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         if (zzlFind(zobj->ptr, member, score) == NULL) return C_ERR;
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
@@ -1364,7 +1279,9 @@ int zsetScore(robj *zobj, sds member, double *score) {
 /* Add a new element or update the score of an existing element in a sorted
  * set, regardless of its encoding.
  *
- * The set of flags change the command behavior. 
+ * The set of flags change the command behavior. They are passed with an integer
+ * pointer since the function will clear the flags and populate them with
+ * other flags to indicate different conditions.
  *
  * The input flags are the following:
  *
@@ -1400,36 +1317,36 @@ int zsetScore(robj *zobj, sds member, double *score) {
  * start.
  *
  * The command as a side effect of adding a new element may convert the sorted
- * set internal encoding from listpack to hashtable+skiplist.
+ * set internal encoding from ziplist to hashtable+skiplist.
  *
  * Memory management of 'ele':
  *
  * The function does not take ownership of the 'ele' SDS string, but copies
  * it if needed. */
-int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore) {
+int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     /* Turn options into simple to check vars. */
-    int incr = (in_flags & ZADD_IN_INCR) != 0;
-    int nx = (in_flags & ZADD_IN_NX) != 0;
-    int xx = (in_flags & ZADD_IN_XX) != 0;
-    int gt = (in_flags & ZADD_IN_GT) != 0;
-    int lt = (in_flags & ZADD_IN_LT) != 0;
-    *out_flags = 0; /* We'll return our response flags. */
+    int incr = (*flags & ZADD_INCR) != 0;
+    int nx = (*flags & ZADD_NX) != 0;
+    int xx = (*flags & ZADD_XX) != 0;
+    int gt = (*flags & ZADD_GT) != 0;
+    int lt = (*flags & ZADD_LT) != 0;
+    *flags = 0; /* We'll return our response flags. */
     double curscore;
 
     /* NaN as input is an error regardless of all the other parameters. */
     if (isnan(score)) {
-        *out_flags = ZADD_OUT_NAN;
+        *flags = ZADD_NAN;
         return 0;
     }
 
     /* Update the sorted set according to its encoding. */
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *eptr;
 
         if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
             /* NX? Return, same element already exists. */
             if (nx) {
-                *out_flags |= ZADD_OUT_NOP;
+                *flags |= ZADD_NOP;
                 return 1;
             }
 
@@ -1437,49 +1354,39 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             if (incr) {
                 score += curscore;
                 if (isnan(score)) {
-                    *out_flags |= ZADD_OUT_NAN;
+                    *flags |= ZADD_NAN;
                     return 0;
                 }
+                if (newscore) *newscore = score;
             }
-
-            /* GT/LT? Only update if score is greater/less than current. */
-            if ((lt && score >= curscore) || (gt && score <= curscore)) {
-                *out_flags |= ZADD_OUT_NOP;
-                return 1;
-            }
-
-            if (newscore) *newscore = score;
 
             /* Remove and re-insert when score changed. */
-            if (score != curscore) {
+            if (score != curscore &&  
+                /* LT? Only update if score is less than current. */
+                (!lt || score < curscore) &&
+                /* GT? Only update if score is greater than current. */
+                (!gt || score > curscore)) 
+            {
                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
                 zobj->ptr = zzlInsert(zobj->ptr,ele,score);
-                *out_flags |= ZADD_OUT_UPDATED;
+                *flags |= ZADD_UPDATED;
             }
             return 1;
         } else if (!xx) {
-            /* check if the element is too large or the list
+            /* Optimize: check if the element is too large or the list
              * becomes too long *before* executing zzlInsert. */
-            if (zzlLength(zobj->ptr)+1 > server.zset_max_listpack_entries ||
-                sdslen(ele) > server.zset_max_listpack_value ||
-                !lpSafeToAdd(zobj->ptr, sdslen(ele)))
-            {
-                zsetConvertAndExpand(zobj, OBJ_ENCODING_SKIPLIST, zsetLength(zobj) + 1);
-            } else {
-                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
-                if (newscore) *newscore = score;
-                *out_flags |= ZADD_OUT_ADDED;
-                return 1;
-            }
+            zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+            if (zzlLength(zobj->ptr) > server.zset_max_ziplist_entries ||
+                sdslen(ele) > server.zset_max_ziplist_value)
+                zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
+            if (newscore) *newscore = score;
+            *flags |= ZADD_ADDED;
+            return 1;
         } else {
-            *out_flags |= ZADD_OUT_NOP;
+            *flags |= ZADD_NOP;
             return 1;
         }
-    }
-
-    /* Note that the above block handling listpack would have either returned or
-     * converted the key to skiplist. */
-    if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         zskiplistNode *znode;
         dictEntry *de;
@@ -1488,48 +1395,45 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
         if (de != NULL) {
             /* NX? Return, same element already exists. */
             if (nx) {
-                *out_flags |= ZADD_OUT_NOP;
+                *flags |= ZADD_NOP;
                 return 1;
             }
-
             curscore = *(double*)dictGetVal(de);
 
             /* Prepare the score for the increment if needed. */
             if (incr) {
                 score += curscore;
                 if (isnan(score)) {
-                    *out_flags |= ZADD_OUT_NAN;
+                    *flags |= ZADD_NAN;
                     return 0;
                 }
+                if (newscore) *newscore = score;
             }
-
-            /* GT/LT? Only update if score is greater/less than current. */
-            if ((lt && score >= curscore) || (gt && score <= curscore)) {
-                *out_flags |= ZADD_OUT_NOP;
-                return 1;
-            }
-
-            if (newscore) *newscore = score;
 
             /* Remove and re-insert when score changes. */
-            if (score != curscore) {
+            if (score != curscore &&  
+                /* LT? Only update if score is less than current. */
+                (!lt || score < curscore) &&
+                /* GT? Only update if score is greater than current. */
+                (!gt || score > curscore)) 
+            {
                 znode = zslUpdateScore(zs->zsl,curscore,ele,score);
                 /* Note that we did not removed the original element from
                  * the hash table representing the sorted set, so we just
                  * update the score. */
-                dictSetVal(zs->dict, de, &znode->score); /* Update score ptr. */
-                *out_flags |= ZADD_OUT_UPDATED;
+                dictGetVal(de) = &znode->score; /* Update score ptr. */
+                *flags |= ZADD_UPDATED;
             }
             return 1;
         } else if (!xx) {
             ele = sdsdup(ele);
             znode = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
-            *out_flags |= ZADD_OUT_ADDED;
+            *flags |= ZADD_ADDED;
             if (newscore) *newscore = score;
             return 1;
         } else {
-            *out_flags |= ZADD_OUT_NOP;
+            *flags |= ZADD_NOP;
             return 1;
         }
     } else {
@@ -1571,7 +1475,7 @@ static int zsetRemoveFromSkiplist(zset *zs, sds ele) {
 /* Delete the element 'ele' from the sorted set, returning 1 if the element
  * existed and was deleted, 0 otherwise (the element was not there). */
 int zsetDel(robj *zobj, sds ele) {
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *eptr;
 
         if ((eptr = zzlFind(zobj->ptr,ele,NULL)) != NULL) {
@@ -1581,6 +1485,7 @@ int zsetDel(robj *zobj, sds ele) {
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
         if (zsetRemoveFromSkiplist(zs, ele)) {
+            if (htNeedsResize(zs->dict)) dictResize(zs->dict);
             return 1;
         }
     } else {
@@ -1600,32 +1505,30 @@ int zsetDel(robj *zobj, sds ele) {
  * the one with the lowest score. Otherwise if 'reverse' is non-zero
  * the rank is computed considering as element with rank 0 the one with
  * the highest score. */
-long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
+long zsetRank(robj *zobj, sds ele, int reverse) {
     unsigned long llen;
     unsigned long rank;
 
     llen = zsetLength(zobj);
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
 
-        eptr = lpSeek(zl,0);
+        eptr = ziplistIndex(zl,0);
         serverAssert(eptr != NULL);
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
 
         rank = 1;
         while(eptr != NULL) {
-            if (lpCompare(eptr,(unsigned char*)ele,sdslen(ele)))
+            if (ziplistCompare(eptr,(unsigned char*)ele,sdslen(ele)))
                 break;
             rank++;
             zzlNext(zl,&eptr,&sptr);
         }
 
         if (eptr != NULL) {
-            if (output_score) 
-                *output_score = zzlGetScore(sptr);
             if (reverse)
                 return llen-rank;
             else
@@ -1645,8 +1548,6 @@ long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
             rank = zslGetRank(zsl,score,ele);
             /* Existing elements always have a rank. */
             serverAssert(rank != 0);
-            if (output_score)
-                *output_score = score;
             if (reverse)
                 return llen-rank;
             else
@@ -1672,13 +1573,13 @@ robj *zsetDup(robj *o) {
     serverAssert(o->type == OBJ_ZSET);
 
     /* Create a new sorted set object that have the same encoding as the original object's encoding */
-    if (o->encoding == OBJ_ENCODING_LISTPACK) {
+    if (o->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = o->ptr;
-        size_t sz = lpBytes(zl);
+        size_t sz = ziplistBlobLen(zl);
         unsigned char *new_zl = zmalloc(sz);
         memcpy(new_zl, zl, sz);
         zobj = createObject(OBJ_ZSET, new_zl);
-        zobj->encoding = OBJ_ENCODING_LISTPACK;
+        zobj->encoding = OBJ_ENCODING_ZIPLIST;
     } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
         zobj = createZsetObject();
         zs = o->ptr;
@@ -1709,13 +1610,62 @@ robj *zsetDup(robj *o) {
     return zobj;
 }
 
-/* Create a new sds string from the listpack entry. */
-sds zsetSdsFromListpackEntry(listpackEntry *e) {
+/* callback for to check the ziplist doesn't have duplicate recoreds */
+static int _zsetZiplistValidateIntegrity(unsigned char *p, void *userdata) {
+    struct {
+        long count;
+        dict *fields;
+    } *data = userdata;
+
+    /* Even records are field names, add to dict and check that's not a dup */
+    if (((data->count) & 1) == 0) {
+        unsigned char *str;
+        unsigned int slen;
+        long long vll;
+        if (!ziplistGet(p, &str, &slen, &vll))
+            return 0;
+        sds field = str? sdsnewlen(str, slen): sdsfromlonglong(vll);;
+        if (dictAdd(data->fields, field, NULL) != DICT_OK) {
+            /* Duplicate, return an error */
+            sdsfree(field);
+            return 0;
+        }
+    }
+
+    (data->count)++;
+    return 1;
+}
+
+/* Validate the integrity of the data stracture.
+ * when `deep` is 0, only the integrity of the header is validated.
+ * when `deep` is 1, we scan all the entries one by one. */
+int zsetZiplistValidateIntegrity(unsigned char *zl, size_t size, int deep) {
+    if (!deep)
+        return ziplistValidateIntegrity(zl, size, 0, NULL, NULL);
+
+    /* Keep track of the field names to locate duplicate ones */
+    struct {
+        long count;
+        dict *fields;
+    } data = {0, dictCreate(&hashDictType, NULL)};
+
+    int ret = ziplistValidateIntegrity(zl, size, 1, _zsetZiplistValidateIntegrity, &data);
+
+    /* make sure we have an even number of records. */
+    if (data.count & 1)
+        ret = 0;
+
+    dictRelease(data.fields);
+    return ret;
+}
+
+/* Create a new sds string from the ziplist entry. */
+sds zsetSdsFromZiplistEntry(ziplistEntry *e) {
     return e->sval ? sdsnewlen(e->sval, e->slen) : sdsfromlonglong(e->lval);
 }
 
-/* Reply with bulk string from the listpack entry. */
-void zsetReplyFromListpackEntry(client *c, listpackEntry *e) {
+/* Reply with bulk string from the ziplist entry. */
+void zsetReplyFromZiplistEntry(client *c, ziplistEntry *e) {
     if (e->sval)
         addReplyBulkCBuffer(c, e->sval, e->slen);
     else
@@ -1727,7 +1677,7 @@ void zsetReplyFromListpackEntry(client *c, listpackEntry *e) {
  * 'key' and 'val' will be set to hold the element.
  * The memory in `key` is not to be freed or modified by the caller.
  * 'score' can be NULL in which case it's not extracted. */
-void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry *key, double *score) {
+void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, ziplistEntry *key, double *score) {
     if (zsetobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zsetobj->ptr;
         dictEntry *de = dictGetFairRandomKey(zs->dict);
@@ -1736,9 +1686,9 @@ void zsetTypeRandomElement(robj *zsetobj, unsigned long zsetsize, listpackEntry 
         key->slen = sdslen(s);
         if (score)
             *score = *(double*)dictGetVal(de);
-    } else if (zsetobj->encoding == OBJ_ENCODING_LISTPACK) {
-        listpackEntry val;
-        lpRandomPair(zsetobj->ptr, zsetsize, key, &val, 2);
+    } else if (zsetobj->encoding == OBJ_ENCODING_ZIPLIST) {
+        ziplistEntry val;
+        ziplistRandomPair(zsetobj->ptr, zsetsize, key, &val);
         if (score) {
             if (val.sval) {
                 *score = zzlStrtod(val.sval,val.slen);
@@ -1762,7 +1712,7 @@ void zaddGenericCommand(client *c, int flags) {
     robj *zobj;
     sds ele;
     double score = 0, *scores = NULL;
-    int j, elements, ch = 0;
+    int j, elements;
     int scoreidx = 0;
     /* The following vars are used in order to track what the command actually
      * did during the execution, to reply to the client and to trigger the
@@ -1777,22 +1727,23 @@ void zaddGenericCommand(client *c, int flags) {
     scoreidx = 2;
     while(scoreidx < c->argc) {
         char *opt = c->argv[scoreidx]->ptr;
-        if (!strcasecmp(opt,"nx")) flags |= ZADD_IN_NX;
-        else if (!strcasecmp(opt,"xx")) flags |= ZADD_IN_XX;
-        else if (!strcasecmp(opt,"ch")) ch = 1; /* Return num of elements added or updated. */
-        else if (!strcasecmp(opt,"incr")) flags |= ZADD_IN_INCR;
-        else if (!strcasecmp(opt,"gt")) flags |= ZADD_IN_GT;
-        else if (!strcasecmp(opt,"lt")) flags |= ZADD_IN_LT;
+        if (!strcasecmp(opt,"nx")) flags |= ZADD_NX;
+        else if (!strcasecmp(opt,"xx")) flags |= ZADD_XX;
+        else if (!strcasecmp(opt,"ch")) flags |= ZADD_CH;
+        else if (!strcasecmp(opt,"incr")) flags |= ZADD_INCR;
+        else if (!strcasecmp(opt,"gt")) flags |= ZADD_GT;
+        else if (!strcasecmp(opt,"lt")) flags |= ZADD_LT;
         else break;
         scoreidx++;
     }
 
     /* Turn options into simple to check vars. */
-    int incr = (flags & ZADD_IN_INCR) != 0;
-    int nx = (flags & ZADD_IN_NX) != 0;
-    int xx = (flags & ZADD_IN_XX) != 0;
-    int gt = (flags & ZADD_IN_GT) != 0;
-    int lt = (flags & ZADD_IN_LT) != 0;
+    int incr = (flags & ZADD_INCR) != 0;
+    int nx = (flags & ZADD_NX) != 0;
+    int xx = (flags & ZADD_XX) != 0;
+    int ch = (flags & ZADD_CH) != 0;
+    int gt = (flags & ZADD_GT) != 0;
+    int lt = (flags & ZADD_LT) != 0;
 
     /* After the options, we expect to have an even number of args, since
      * we expect any number of score-element pairs. */
@@ -1837,31 +1788,33 @@ void zaddGenericCommand(client *c, int flags) {
     if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
     if (zobj == NULL) {
         if (xx) goto reply_to_client; /* No key + XX option: nothing to do. */
-        zobj = zsetTypeCreate(elements, sdslen(c->argv[scoreidx+1]->ptr));
+        if (server.zset_max_ziplist_entries == 0 ||
+            server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
+        {
+            zobj = createZsetObject();
+        } else {
+            zobj = createZsetZiplistObject();
+        }
         dbAdd(c->db,key,zobj);
-    } else {
-        zsetTypeMaybeConvert(zobj, elements);
     }
 
-    unsigned long llen = zsetLength(zobj);
     for (j = 0; j < elements; j++) {
         double newscore;
         score = scores[j];
-        int retflags = 0;
+        int retflags = flags;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
-        int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
+        int retval = zsetAdd(zobj, score, ele, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
             goto cleanup;
         }
-        if (retflags & ZADD_OUT_ADDED) added++;
-        if (retflags & ZADD_OUT_UPDATED) updated++;
-        if (!(retflags & ZADD_OUT_NOP)) processed++;
+        if (retflags & ZADD_ADDED) added++;
+        if (retflags & ZADD_UPDATED) updated++;
+        if (!(retflags & ZADD_NOP)) processed++;
         score = newscore;
     }
     server.dirty += (added+updated);
-    updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, llen, llen+added);
 
 reply_to_client:
     if (incr) { /* ZINCRBY or INCR option. */
@@ -1883,11 +1836,11 @@ cleanup:
 }
 
 void zaddCommand(client *c) {
-    zaddGenericCommand(c,ZADD_IN_NONE);
+    zaddGenericCommand(c,ZADD_NONE);
 }
 
 void zincrbyCommand(client *c) {
-    zaddGenericCommand(c,ZADD_IN_INCR);
+    zaddGenericCommand(c,ZADD_INCR);
 }
 
 void zremCommand(client *c) {
@@ -1909,13 +1862,8 @@ void zremCommand(client *c) {
 
     if (deleted) {
         notifyKeyspaceEvent(NOTIFY_ZSET,"zrem",key,c->db->id);
-        if (keyremoved) {            
-            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
-            /* No need updateKeysizesHist(). dbDelete() done it already. */
-        } else {
-            unsigned long len =  zsetLength(zobj);
-            updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, len + deleted, len);
-        }
+        if (keyremoved)
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
         signalModifiedKey(c,c->db,key);
         server.dirty += deleted;
     }
@@ -1983,7 +1931,7 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
     }
 
     /* Step 3: Perform the range deletion operation. */
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         switch(rangetype) {
         case ZRANGE_AUTO:
         case ZRANGE_RANK:
@@ -2002,7 +1950,6 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
         }
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
         zset *zs = zobj->ptr;
-        dictPauseAutoResize(zs->dict);
         switch(rangetype) {
         case ZRANGE_AUTO:
         case ZRANGE_RANK:
@@ -2015,12 +1962,10 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
             deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict);
             break;
         }
-        dictResumeAutoResize(zs->dict);
+        if (htNeedsResize(zs->dict)) dictResize(zs->dict);
         if (dictSize(zs->dict) == 0) {
             dbDelete(c->db,key);
             keyremoved = 1;
-        } else {
-            dictShrinkIfNeeded(zs->dict);
         }
     } else {
         serverPanic("Unknown sorted set encoding");
@@ -2030,13 +1975,8 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
     if (deleted) {
         signalModifiedKey(c,c->db,key);
         notifyKeyspaceEvent(NOTIFY_ZSET,notify_type,key,c->db->id);
-        if (keyremoved) {
-            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
-            /* No need updateKeysizesHist(). dbDelete() done it already. */
-        } else {
-            unsigned long len =  zsetLength(zobj);
-            updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, len + deleted, len);
-        }
+        if (keyremoved)
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
     }
     server.dirty += deleted;
     addReplyLongLong(c,deleted);
@@ -2075,10 +2015,6 @@ typedef struct {
                 dictIterator *di;
                 dictEntry *de;
             } ht;
-            struct {
-                unsigned char *lp;
-                unsigned char *p;
-            } lp;
         } set;
 
         /* Sorted set iterators. */
@@ -2133,9 +2069,6 @@ void zuiInitIterator(zsetopsrc *op) {
             it->ht.dict = op->subject->ptr;
             it->ht.di = dictGetIterator(op->subject->ptr);
             it->ht.de = dictNext(it->ht.di);
-        } else if (op->encoding == OBJ_ENCODING_LISTPACK) {
-            it->lp.lp = op->subject->ptr;
-            it->lp.p = lpFirst(it->lp.lp);
         } else {
             serverPanic("Unknown set encoding");
         }
@@ -2144,11 +2077,11 @@ void zuiInitIterator(zsetopsrc *op) {
          * the insertion of the elements in a new list as in
          * ZDIFF/ZINTER/ZUNION */
         iterzset *it = &op->iter.zset;
-        if (op->encoding == OBJ_ENCODING_LISTPACK) {
+        if (op->encoding == OBJ_ENCODING_ZIPLIST) {
             it->zl.zl = op->subject->ptr;
-            it->zl.eptr = lpSeek(it->zl.zl,-2);
+            it->zl.eptr = ziplistIndex(it->zl.zl,-2);
             if (it->zl.eptr != NULL) {
-                it->zl.sptr = lpNext(it->zl.zl,it->zl.eptr);
+                it->zl.sptr = ziplistNext(it->zl.zl,it->zl.eptr);
                 serverAssert(it->zl.sptr != NULL);
             }
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -2172,14 +2105,12 @@ void zuiClearIterator(zsetopsrc *op) {
             UNUSED(it); /* skip */
         } else if (op->encoding == OBJ_ENCODING_HT) {
             dictReleaseIterator(it->ht.di);
-        } else if (op->encoding == OBJ_ENCODING_LISTPACK) {
-            UNUSED(it);
         } else {
             serverPanic("Unknown set encoding");
         }
     } else if (op->type == OBJ_ZSET) {
         iterzset *it = &op->iter.zset;
-        if (op->encoding == OBJ_ENCODING_LISTPACK) {
+        if (op->encoding == OBJ_ENCODING_ZIPLIST) {
             UNUSED(it); /* skip */
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             UNUSED(it); /* skip */
@@ -2191,22 +2122,21 @@ void zuiClearIterator(zsetopsrc *op) {
     }
 }
 
-void zuiDiscardDirtyValue(zsetopval *val) {
-    if (val->flags & OPVAL_DIRTY_SDS) {
-        sdsfree(val->ele);
-        val->ele = NULL;
-        val->flags &= ~OPVAL_DIRTY_SDS;
-    }
-}
-
 unsigned long zuiLength(zsetopsrc *op) {
     if (op->subject == NULL)
         return 0;
 
     if (op->type == OBJ_SET) {
-        return setTypeSize(op->subject);
+        if (op->encoding == OBJ_ENCODING_INTSET) {
+            return intsetLen(op->subject->ptr);
+        } else if (op->encoding == OBJ_ENCODING_HT) {
+            dict *ht = op->subject->ptr;
+            return dictSize(ht);
+        } else {
+            serverPanic("Unknown set encoding");
+        }
     } else if (op->type == OBJ_ZSET) {
-        if (op->encoding == OBJ_ENCODING_LISTPACK) {
+        if (op->encoding == OBJ_ENCODING_ZIPLIST) {
             return zzlLength(op->subject->ptr);
         } else if (op->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = op->subject->ptr;
@@ -2226,7 +2156,8 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
     if (op->subject == NULL)
         return 0;
 
-    zuiDiscardDirtyValue(val);
+    if (val->flags & OPVAL_DIRTY_SDS)
+        sdsfree(val->ele);
 
     memset(val,0,sizeof(zsetopval));
 
@@ -2250,24 +2181,16 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
 
             /* Move to next element. */
             it->ht.de = dictNext(it->ht.di);
-        } else if (op->encoding == OBJ_ENCODING_LISTPACK) {
-            if (it->lp.p == NULL)
-                return 0;
-            val->estr = lpGetValue(it->lp.p, &val->elen, &val->ell);
-            val->score = 1.0;
-
-            /* Move to next element. */
-            it->lp.p = lpNext(it->lp.lp, it->lp.p);
         } else {
             serverPanic("Unknown set encoding");
         }
     } else if (op->type == OBJ_ZSET) {
         iterzset *it = &op->iter.zset;
-        if (op->encoding == OBJ_ENCODING_LISTPACK) {
+        if (op->encoding == OBJ_ENCODING_ZIPLIST) {
             /* No need to check both, but better be explicit. */
             if (it->zl.eptr == NULL || it->zl.sptr == NULL)
                 return 0;
-            val->estr = lpGetValue(it->zl.eptr,&val->elen,&val->ell);
+            serverAssert(ziplistGet(it->zl.eptr,&val->estr,&val->elen,&val->ell));
             val->score = zzlGetScore(it->zl.sptr);
 
             /* Move to next element (going backwards, see zuiInitIterator). */
@@ -2357,18 +2280,31 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         return 0;
 
     if (op->type == OBJ_SET) {
-        char *str = val->ele ? val->ele : (char *)val->estr;
-        size_t len = val->ele ? sdslen(val->ele) : val->elen;
-        if (setTypeIsMemberAux(op->subject, str, len, val->ell, val->ele != NULL)) {
-            *score = 1.0;
-            return 1;
+        if (op->encoding == OBJ_ENCODING_INTSET) {
+            if (zuiLongLongFromValue(val) &&
+                intsetFind(op->subject->ptr,val->ell))
+            {
+                *score = 1.0;
+                return 1;
+            } else {
+                return 0;
+            }
+        } else if (op->encoding == OBJ_ENCODING_HT) {
+            dict *ht = op->subject->ptr;
+            zuiSdsFromValue(val);
+            if (dictFind(ht,val->ele) != NULL) {
+                *score = 1.0;
+                return 1;
+            } else {
+                return 0;
+            }
         } else {
-            return 0;
+            serverPanic("Unknown set encoding");
         }
     } else if (op->type == OBJ_ZSET) {
         zuiSdsFromValue(val);
 
-        if (op->encoding == OBJ_ENCODING_LISTPACK) {
+        if (op->encoding == OBJ_ENCODING_ZIPLIST) {
             if (zzlFind(op->subject->ptr,val->ele,score) != NULL) {
                 /* Score is already set by zzlFind. */
                 return 1;
@@ -2426,7 +2362,7 @@ inline static void zunionInterAggregate(double *target, double val, int aggregat
     }
 }
 
-static size_t zsetDictGetMaxElementLength(dict *d, size_t *totallen) {
+static int zsetDictGetMaxElementLength(dict *d) {
     dictIterator *di;
     dictEntry *de;
     size_t maxelelen = 0;
@@ -2436,8 +2372,6 @@ static size_t zsetDictGetMaxElementLength(dict *d, size_t *totallen) {
     while((de = dictNext(di)) != NULL) {
         sds ele = dictGetKey(de);
         if (sdslen(ele) > maxelelen) maxelelen = sdslen(ele);
-        if (totallen)
-            (*totallen) += sdslen(ele);
     }
 
     dictReleaseIterator(di);
@@ -2445,7 +2379,7 @@ static size_t zsetDictGetMaxElementLength(dict *d, size_t *totallen) {
     return maxelelen;
 }
 
-static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen) {
     /* DIFF Algorithm 1:
      *
      * We perform the diff by iterating all the elements of the first set,
@@ -2493,14 +2427,13 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
             znode = zslInsert(dstzset->zsl,zval.score,tmp);
             dictAdd(dstzset->dict,tmp,&znode->score);
             if (sdslen(tmp) > *maxelelen) *maxelelen = sdslen(tmp);
-            (*totelelen) += sdslen(tmp);
         }
     }
     zuiClearIterator(&src[0]);
 }
 
 
-static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen) {
     /* DIFF Algorithm 2:
      *
      * Add all the elements of the first set to the auxiliary set.
@@ -2534,12 +2467,10 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
                 dictAdd(dstzset->dict,tmp,&znode->score);
                 cardinality++;
             } else {
-                dictPauseAutoResize(dstzset->dict);
                 tmp = zuiSdsFromValue(&zval);
                 if (zsetRemoveFromSkiplist(dstzset, tmp)) {
                     cardinality--;
                 }
-                dictResumeAutoResize(dstzset->dict);
             }
 
             /* Exit if result set is empty as any additional removal
@@ -2551,12 +2482,12 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         if (cardinality == 0) break;
     }
 
-    /* Resize dict if needed after removing multiple elements */
-    dictShrinkIfNeeded(dstzset->dict);
+    /* Redize dict if needed after removing multiple elements */
+    if (htNeedsResize(dstzset->dict)) dictResize(dstzset->dict);
 
     /* Using this algorithm, we can't calculate the max element as we go,
      * we have to iterate through all elements to find the max one after. */
-    *maxelelen = zsetDictGetMaxElementLength(dstzset->dict, totelelen);
+    *maxelelen = zsetDictGetMaxElementLength(dstzset->dict);
 }
 
 static int zsetChooseDiffAlgorithm(zsetopsrc *src, long setnum) {
@@ -2593,55 +2524,61 @@ static int zsetChooseDiffAlgorithm(zsetopsrc *src, long setnum) {
     return (algo_one_work <= algo_two_work) ? 1 : 2;
 }
 
-static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen, size_t *totelelen) {
+static void zdiff(zsetopsrc *src, long setnum, zset *dstzset, size_t *maxelelen) {
     /* Skip everything if the smallest input is empty. */
     if (zuiLength(&src[0]) > 0) {
         int diff_algo = zsetChooseDiffAlgorithm(src, setnum);
         if (diff_algo == 1) {
-            zdiffAlgorithm1(src, setnum, dstzset, maxelelen, totelelen);
+            zdiffAlgorithm1(src, setnum, dstzset, maxelelen);
         } else if (diff_algo == 2) {
-            zdiffAlgorithm2(src, setnum, dstzset, maxelelen, totelelen);
+            zdiffAlgorithm2(src, setnum, dstzset, maxelelen);
         } else if (diff_algo != 0) {
             serverPanic("Unknown algorithm");
         }
     }
 }
 
+uint64_t dictSdsHash(const void *key);
+int dictSdsKeyCompare(void *privdata, const void *key1, const void *key2);
+
+dictType setAccumulatorDictType = {
+    dictSdsHash,               /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictSdsKeyCompare,         /* key compare */
+    NULL,                      /* key destructor */
+    NULL,                      /* val destructor */
+    NULL                       /* allow to expand */
+};
+
 /* The zunionInterDiffGenericCommand() function is called in order to implement the
- * following commands: ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE,
- * ZINTERCARD.
+ * following commands: ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE.
  *
  * 'numkeysIndex' parameter position of key number. for ZUNION/ZINTER/ZDIFF command,
  * this value is 1, for ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE command, this value is 2.
  *
  * 'op' SET_OP_INTER, SET_OP_UNION or SET_OP_DIFF.
- *
- * 'cardinality_only' is currently only applicable when 'op' is SET_OP_INTER.
- * Work for SINTERCARD, only return the cardinality with minimum processing and memory overheads.
  */
-void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, int op,
-                                   int cardinality_only) {
+void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, int op) {
     int i, j;
     long setnum;
     int aggregate = REDIS_AGGR_SUM;
     zsetopsrc *src;
     zsetopval zval;
     sds tmp;
-    size_t maxelelen = 0, totelelen = 0;
-    robj *dstobj = NULL;
-    zset *dstzset = NULL;
+    size_t maxelelen = 0;
+    robj *dstobj;
+    zset *dstzset;
     zskiplistNode *znode;
     int withscores = 0;
-    unsigned long cardinality = 0;
-    long limit = 0; /* Stop searching after reaching the limit. 0 means unlimited. */
 
     /* expect setnum input keys to be given */
     if ((getLongFromObjectOrReply(c, c->argv[numkeysIndex], &setnum, NULL) != C_OK))
         return;
 
     if (setnum < 1) {
-        addReplyErrorFormat(c,
-            "at least 1 input key is needed for '%s' command", c->cmd->fullname);
+        addReplyError(c,
+            "at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE");
         return;
     }
 
@@ -2651,16 +2588,12 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         return;
     }
 
-    /* Try to allocate the src table, and abort on insufficient memory. */
-    src = ztrycalloc(sizeof(zsetopsrc) * setnum);
-    if (src == NULL) {
-        addReplyError(c, "Insufficient memory, failed allocating transient memory, too many args.");
-        return;
-    }
-
     /* read keys to be used for input */
+    src = zcalloc(sizeof(zsetopsrc) * setnum);
     for (i = 0, j = numkeysIndex+1; i < setnum; i++, j++) {
-        robj *obj = lookupKeyRead(c->db, c->argv[j]);
+        robj *obj = dstkey ?
+            lookupKeyWrite(c->db,c->argv[j]) :
+            lookupKeyRead(c->db,c->argv[j]);
         if (obj != NULL) {
             if (obj->type != OBJ_ZSET && obj->type != OBJ_SET) {
                 zfree(src);
@@ -2684,7 +2617,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         int remaining = c->argc - j;
 
         while (remaining) {
-            if (op != SET_OP_DIFF && !cardinality_only &&
+            if (op != SET_OP_DIFF &&
                 remaining >= (setnum + 1) &&
                 !strcasecmp(c->argv[j]->ptr,"weights"))
             {
@@ -2697,7 +2630,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                         return;
                     }
                 }
-            } else if (op != SET_OP_DIFF && !cardinality_only &&
+            } else if (op != SET_OP_DIFF &&
                        remaining >= 2 &&
                        !strcasecmp(c->argv[j]->ptr,"aggregate"))
             {
@@ -2715,22 +2648,11 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 }
                 j++; remaining--;
             } else if (remaining >= 1 &&
-                       !dstkey && !cardinality_only &&
+                       !dstkey &&
                        !strcasecmp(c->argv[j]->ptr,"withscores"))
             {
                 j++; remaining--;
                 withscores = 1;
-            } else if (cardinality_only && remaining >= 2 &&
-                       !strcasecmp(c->argv[j]->ptr, "limit"))
-            {
-                j++; remaining--;
-                if (getPositiveLongFromObjectOrReply(c, c->argv[j], &limit,
-                                                     "LIMIT can't be negative") != C_OK)
-                {
-                    zfree(src);
-                    return;
-                }
-                j++; remaining--;
             } else {
                 zfree(src);
                 addReplyErrorObject(c,shared.syntaxerr);
@@ -2745,14 +2667,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         qsort(src,setnum,sizeof(zsetopsrc),zuiCompareByCardinality);
     }
 
-    /* We need a temp zset object to store our union/inter/diff. If the dstkey
-     * is not NULL (that is, we are inside an ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE operation) then
-     * this zset object will be the resulting object to zset into the target key.
-     * In SINTERCARD case, we don't need the temp obj, so we can avoid creating it. */
-    if (!cardinality_only) {
-        dstobj = createZsetObject();
-        dstzset = dstobj->ptr;
-    }
+    dstobj = createZsetObject();
+    dstzset = dstobj->ptr;
     memset(&zval, 0, sizeof(zval));
 
     if (op == SET_OP_INTER) {
@@ -2782,26 +2698,17 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 }
 
                 /* Only continue when present in every input. */
-                if (j == setnum && cardinality_only) {
-                    cardinality++;
-
-                    /* We stop the searching after reaching the limit. */
-                    if (limit && cardinality >= (unsigned long)limit) {
-                        /* Cleanup before we break the zuiNext loop. */
-                        zuiDiscardDirtyValue(&zval);
-                        break;
-                    }
-                } else if (j == setnum) {
+                if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
                     znode = zslInsert(dstzset->zsl,score,tmp);
                     dictAdd(dstzset->dict,tmp,&znode->score);
-                    totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
                 }
             }
             zuiClearIterator(&src[0]);
         }
     } else if (op == SET_OP_UNION) {
+        dict *accumulator = dictCreate(&setAccumulatorDictType,NULL);
         dictIterator *di;
         dictEntry *de, *existing;
         double score;
@@ -2809,7 +2716,7 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         if (setnum) {
             /* Our union is at least as large as the largest set.
              * Resize the dictionary ASAP to avoid useless rehashing. */
-            dictExpand(dstzset->dict,zuiLength(&src[setnum-1]));
+            dictExpand(accumulator,zuiLength(&src[setnum-1]));
         }
 
         /* Step 1: Create a dictionary of elements -> aggregated-scores
@@ -2824,17 +2731,16 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 if (isnan(score)) score = 0;
 
                 /* Search for this element in the accumulating dictionary. */
-                de = dictAddRaw(dstzset->dict,zuiSdsFromValue(&zval),&existing);
+                de = dictAddRaw(accumulator,zuiSdsFromValue(&zval),&existing);
                 /* If we don't have it, we need to create a new entry. */
                 if (!existing) {
                     tmp = zuiNewSdsFromValue(&zval);
                     /* Remember the longest single element encountered,
-                     * to understand if it's possible to convert to listpack
+                     * to understand if it's possible to convert to ziplist
                      * at the end. */
-                     totelelen += sdslen(tmp);
                      if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
                     /* Update the element with its initial score. */
-                    dictSetKey(dstzset->dict, de, tmp);
+                    dictSetKey(accumulator, de, tmp);
                     dictSetDoubleVal(de,score);
                 } else {
                     /* Update the score with the score of the new instance
@@ -2843,33 +2749,38 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                      * Here we access directly the dictEntry double
                      * value inside the union as it is a big speedup
                      * compared to using the getDouble/setDouble API. */
-                    double *existing_score_ptr = dictGetDoubleValPtr(existing);
-                    zunionInterAggregate(existing_score_ptr, score, aggregate);
+                    zunionInterAggregate(&existing->v.d,score,aggregate);
                 }
             }
             zuiClearIterator(&src[i]);
         }
 
         /* Step 2: convert the dictionary into the final sorted set. */
-        di = dictGetIterator(dstzset->dict);
+        di = dictGetIterator(accumulator);
+
+        /* We now are aware of the final size of the resulting sorted set,
+         * let's resize the dictionary embedded inside the sorted set to the
+         * right size, in order to save rehashing time. */
+        dictExpand(dstzset->dict,dictSize(accumulator));
 
         while((de = dictNext(di)) != NULL) {
             sds ele = dictGetKey(de);
             score = dictGetDoubleVal(de);
             znode = zslInsert(dstzset->zsl,score,ele);
-            dictSetVal(dstzset->dict,de,&znode->score);
+            dictAdd(dstzset->dict,ele,&znode->score);
         }
         dictReleaseIterator(di);
+        dictRelease(accumulator);
     } else if (op == SET_OP_DIFF) {
-        zdiff(src, setnum, dstzset, &maxelelen, &totelelen);
+        zdiff(src, setnum, dstzset, &maxelelen);
     } else {
         serverPanic("Unknown operator");
     }
 
     if (dstkey) {
         if (dstzset->zsl->length) {
-            zsetConvertToListpackIfNeeded(dstobj, maxelelen, totelelen);
-            setKey(c, c->db, dstkey, dstobj, 0);
+            zsetConvertToZiplistIfNeeded(dstobj, maxelelen);
+            setKey(c, c->db, dstkey, dstobj);
             addReplyLongLong(c, zsetLength(dstobj));
             notifyKeyspaceEvent(NOTIFY_ZSET,
                                 (op == SET_OP_UNION) ? "zunionstore" :
@@ -2884,9 +2795,6 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                 server.dirty++;
             }
         }
-        decrRefCount(dstobj);
-    } else if (cardinality_only) {
-        addReplyLongLong(c, cardinality);
     } else {
         unsigned long length = dstzset->zsl->length;
         zskiplist *zsl = dstzset->zsl;
@@ -2905,45 +2813,33 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
             if (withscores) addReplyDouble(c,zn->score);
             zn = zn->level[0].forward;
         }
-        server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstobj, -1) :
-                                          decrRefCount(dstobj);
     }
+    decrRefCount(dstobj);
     zfree(src);
 }
 
-/* ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight] [AGGREGATE SUM|MIN|MAX] */
 void zunionstoreCommand(client *c) {
-    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_UNION, 0);
+    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_UNION);
 }
 
-/* ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight] [AGGREGATE SUM|MIN|MAX] */
 void zinterstoreCommand(client *c) {
-    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_INTER, 0);
+    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_INTER);
 }
 
-/* ZDIFFSTORE destination numkeys key [key ...] */
 void zdiffstoreCommand(client *c) {
-    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_DIFF, 0);
+    zunionInterDiffGenericCommand(c, c->argv[1], 2, SET_OP_DIFF);
 }
 
-/* ZUNION numkeys key [key ...] [WEIGHTS weight] [AGGREGATE SUM|MIN|MAX] [WITHSCORES] */
 void zunionCommand(client *c) {
-    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_UNION, 0);
+    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_UNION);
 }
 
-/* ZINTER numkeys key [key ...] [WEIGHTS weight] [AGGREGATE SUM|MIN|MAX] [WITHSCORES] */
 void zinterCommand(client *c) {
-    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_INTER, 0);
+    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_INTER);
 }
 
-/* ZINTERCARD numkeys key [key ...] [LIMIT limit] */
-void zinterCardCommand(client *c) {
-    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_INTER, 1);
-}
-
-/* ZDIFF numkeys key [key ...] [WITHSCORES] */
 void zdiffCommand(client *c) {
-    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_DIFF, 0);
+    zunionInterDiffGenericCommand(c, NULL, 1, SET_OP_DIFF);
 }
 
 typedef enum {
@@ -2959,7 +2855,7 @@ typedef enum {
 
 typedef struct zrange_result_handler zrange_result_handler;
 
-typedef void (*zrangeResultBeginFunction)(zrange_result_handler *c, long length);
+typedef void (*zrangeResultBeginFunction)(zrange_result_handler *c);
 typedef void (*zrangeResultFinalizeFunction)(
     zrange_result_handler *c, size_t result_count);
 typedef void (*zrangeResultEmitCBufferFunction)(
@@ -2987,22 +2883,8 @@ struct zrange_result_handler {
     zrangeResultEmitLongLongFunction     emitResultFromLongLong;
 };
 
-/* Result handler methods for responding the ZRANGE to clients.
- * length can be used to provide the result length in advance (avoids deferred reply overhead).
- * length can be set to -1 if the result length is not know in advance.
- */
-static void zrangeResultBeginClient(zrange_result_handler *handler, long length) {
-    if (length > 0) {
-        /* In case of WITHSCORES, respond with a single array in RESP2, and
-        * nested arrays in RESP3. We can't use a map response type since the
-        * client library needs to know to respect the order. */
-        if (handler->withscores && (handler->client->resp == 2)) {
-            length *= 2;
-        }
-        addReplyArrayLen(handler->client, length);
-        handler->userdata = NULL;
-        return;
-    }
+/* Result handler methods for responding the ZRANGE to clients. */
+static void zrangeResultBeginClient(zrange_result_handler *handler) {
     handler->userdata = addReplyDeferredLen(handler->client);
 }
 
@@ -3037,9 +2919,6 @@ static void zrangeResultEmitLongLongToClient(zrange_result_handler *handler,
 static void zrangeResultFinalizeClient(zrange_result_handler *handler,
     size_t result_count)
 {
-    /* If the reply size was know at start there's nothing left to do */
-    if (!handler->userdata)
-        return;
     /* In case of WITHSCORES, respond with a single array in RESP2, and
      * nested arrays in RESP3. We can't use a map response type since the
      * client library needs to know to respect the order. */
@@ -3051,9 +2930,9 @@ static void zrangeResultFinalizeClient(zrange_result_handler *handler,
 }
 
 /* Result handler methods for storing the ZRANGESTORE to a zset. */
-static void zrangeResultBeginStore(zrange_result_handler *handler, long length)
+static void zrangeResultBeginStore(zrange_result_handler *handler)
 {
-    handler->dstobj = zsetTypeCreate(length >= 0 ? length : 0, 0);
+    handler->dstobj = createZsetZiplistObject();
 }
 
 static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
@@ -3062,7 +2941,7 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
     double newscore;
     int retflags = 0;
     sds ele = sdsnewlen(value, value_length_in_bytes);
-    int retval = zsetAdd(handler->dstobj, score, ele, ZADD_IN_NONE, &retflags, &newscore);
+    int retval = zsetAdd(handler->dstobj, score, ele, &retflags, &newscore);
     sdsfree(ele);
     serverAssert(retval);
 }
@@ -3073,7 +2952,7 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
     double newscore;
     int retflags = 0;
     sds ele = sdsfromlonglong(value);
-    int retval = zsetAdd(handler->dstobj, score, ele, ZADD_IN_NONE, &retflags, &newscore);
+    int retval = zsetAdd(handler->dstobj, score, ele, &retflags, &newscore);
     sdsfree(ele);
     serverAssert(retval);
 }
@@ -3081,7 +2960,7 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
 static void zrangeResultFinalizeStore(zrange_result_handler *handler, size_t result_count)
 {
     if (result_count) {
-        setKey(handler->client, handler->client->db, handler->dstkey, handler->dstobj, 0);
+        setKey(handler->client, handler->client->db, handler->dstkey, handler->dstobj);
         addReplyLongLong(handler->client, result_count);
         notifyKeyspaceEvent(NOTIFY_ZSET, "zrangestore", handler->dstkey, handler->client->db->id);
         server.dirty++;
@@ -3147,11 +3026,11 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     if (end < 0) end = llen+end;
     if (start < 0) start = 0;
 
+    handler->beginResultEmission(handler);
 
     /* Invariant: start >= 0, so this test will be true when end < 0.
      * The range is empty when start > end or start >= length. */
     if (start > end || start >= llen) {
-        handler->beginResultEmission(handler, 0);
         handler->finalizeResultEmission(handler, 0);
         return;
     }
@@ -3159,8 +3038,7 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
     rangelen = (end-start)+1;
     result_cardinality = rangelen;
 
-    handler->beginResultEmission(handler, rangelen);
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
@@ -3169,16 +3047,16 @@ void genericZrangebyrankCommand(zrange_result_handler *handler,
         double score = 0.0;
 
         if (reverse)
-            eptr = lpSeek(zl,-2-(2*start));
+            eptr = ziplistIndex(zl,-2-(2*start));
         else
-            eptr = lpSeek(zl,2*start);
+            eptr = ziplistIndex(zl,2*start);
 
         serverAssertWithInfo(c,zobj,eptr != NULL);
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
 
         while (rangelen--) {
             serverAssertWithInfo(c,zobj,eptr != NULL && sptr != NULL);
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
 
             if (withscores) /* don't bother to extract the score if it's gonna be ignored. */
                 score = zzlGetScore(sptr);
@@ -3240,7 +3118,7 @@ void zrangeCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_AUTO, ZRANGE_DIRECTION_AUTO);
 }
 
-/* ZREVRANGE <key> <start> <stop> [WITHSCORES] */
+/* ZREVRANGE <key> <min> <max> [WITHSCORES] */
 void zrevrangeCommand(client *c) {
     zrange_result_handler handler;
     zrangeResultHandlerInit(&handler, c, ZRANGE_CONSUMER_TYPE_CLIENT);
@@ -3251,9 +3129,11 @@ void zrevrangeCommand(client *c) {
 void genericZrangebyscoreCommand(zrange_result_handler *handler,
     zrangespec *range, robj *zobj, long offset, long limit, 
     int reverse) {
+
+    client *c = handler->client;
     unsigned long rangelen = 0;
 
-    handler->beginResultEmission(handler, -1);
+    handler->beginResultEmission(handler);
 
     /* For invalid offset, return directly. */
     if (offset > 0 && offset >= (long)zsetLength(zobj)) {
@@ -3261,7 +3141,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
         return;
     }
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
@@ -3277,7 +3157,7 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
 
         /* Get score pointer for the first element. */
         if (eptr)
-            sptr = lpNext(zl,eptr);
+            sptr = ziplistNext(zl,eptr);
 
         /* If there is an offset, just traverse the number of elements without
          * checking the score because that is done in the next loop. */
@@ -3299,7 +3179,10 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
                 if (!zslValueLteMax(score,range)) break;
             }
 
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            /* We know the element exists, so ziplistGet should always
+             * succeed */
+            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+
             rangelen++;
             if (vstr == NULL) {
                 handler->emitResultFromLongLong(handler, vlong, score);
@@ -3321,9 +3204,19 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
 
         /* If reversed, get the last node in range as starting point. */
         if (reverse) {
-            ln = zslNthInRange(zsl,range,-offset-1);
+            ln = zslLastInRange(zsl,range);
         } else {
-            ln = zslNthInRange(zsl,range,offset);
+            ln = zslFirstInRange(zsl,range);
+        }
+
+        /* If there is an offset, just traverse the number of elements without
+         * checking the score because that is done in the next loop. */
+        while (ln && offset--) {
+            if (reverse) {
+                ln = ln->backward;
+            } else {
+                ln = ln->level[0].forward;
+            }
         }
 
         while (ln && limit--) {
@@ -3358,7 +3251,7 @@ void zrangebyscoreCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_SCORE, ZRANGE_DIRECTION_FORWARD);
 }
 
-/* ZREVRANGEBYSCORE <key> <max> <min> [WITHSCORES] [LIMIT offset count] */
+/* ZREVRANGEBYSCORE <key> <min> <max> [WITHSCORES] [LIMIT offset count] */
 void zrevrangebyscoreCommand(client *c) {
     zrange_result_handler handler;
     zrangeResultHandlerInit(&handler, c, ZRANGE_CONSUMER_TYPE_CLIENT);
@@ -3381,7 +3274,7 @@ void zcountCommand(client *c) {
     if ((zobj = lookupKeyReadOrReply(c, key, shared.czero)) == NULL ||
         checkType(c, zobj, OBJ_ZSET)) return;
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         double score;
@@ -3396,7 +3289,7 @@ void zcountCommand(client *c) {
         }
 
         /* First element is in range */
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         score = zzlGetScore(sptr);
         serverAssertWithInfo(c,zobj,zslValueLteMax(score,&range));
 
@@ -3419,7 +3312,7 @@ void zcountCommand(client *c) {
         unsigned long rank;
 
         /* Find first element in range */
-        zn = zslNthInRange(zsl, &range, 0);
+        zn = zslFirstInRange(zsl, &range);
 
         /* Use rank of first element, if any, to determine preliminary count */
         if (zn != NULL) {
@@ -3427,7 +3320,7 @@ void zcountCommand(client *c) {
             count = (zsl->length - (rank - 1));
 
             /* Find last element in range */
-            zn = zslNthInRange(zsl, &range, -1);
+            zn = zslLastInRange(zsl, &range);
 
             /* Use rank of last element, if any, to determine the actual count */
             if (zn != NULL) {
@@ -3462,7 +3355,7 @@ void zlexcountCommand(client *c) {
         return;
     }
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
 
@@ -3477,7 +3370,7 @@ void zlexcountCommand(client *c) {
         }
 
         /* First element is in range */
-        sptr = lpNext(zl,eptr);
+        sptr = ziplistNext(zl,eptr);
         serverAssertWithInfo(c,zobj,zzlLexValueLteMax(eptr,&range));
 
         /* Iterate over elements in range */
@@ -3497,7 +3390,7 @@ void zlexcountCommand(client *c) {
         unsigned long rank;
 
         /* Find first element in range */
-        zn = zslNthInLexRange(zsl, &range, 0);
+        zn = zslFirstInLexRange(zsl, &range);
 
         /* Use rank of first element, if any, to determine preliminary count */
         if (zn != NULL) {
@@ -3505,7 +3398,7 @@ void zlexcountCommand(client *c) {
             count = (zsl->length - (rank - 1));
 
             /* Find last element in range */
-            zn = zslNthInLexRange(zsl, &range, -1);
+            zn = zslLastInLexRange(zsl, &range);
 
             /* Use rank of last element, if any, to determine the actual count */
             if (zn != NULL) {
@@ -3526,11 +3419,12 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
     zlexrangespec *range, robj *zobj, int withscores, long offset, long limit,
     int reverse)
 {
+    client *c = handler->client;
     unsigned long rangelen = 0;
 
-    handler->beginResultEmission(handler, -1);
+    handler->beginResultEmission(handler);
 
-    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+    if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
         unsigned char *eptr, *sptr;
         unsigned char *vstr;
@@ -3546,7 +3440,7 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
 
         /* Get score pointer for the first element. */
         if (eptr)
-            sptr = lpNext(zl,eptr);
+            sptr = ziplistNext(zl,eptr);
 
         /* If there is an offset, just traverse the number of elements without
          * checking the score because that is done in the next loop. */
@@ -3570,7 +3464,10 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
                 if (!zzlLexValueLteMax(eptr,range)) break;
             }
 
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            /* We know the element exists, so ziplistGet should always
+             * succeed. */
+            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+
             rangelen++;
             if (vstr == NULL) {
                 handler->emitResultFromLongLong(handler, vlong, score);
@@ -3592,9 +3489,19 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
 
         /* If reversed, get the last node in range as starting point. */
         if (reverse) {
-            ln = zslNthInLexRange(zsl,range,-offset-1);
+            ln = zslLastInLexRange(zsl,range);
         } else {
-            ln = zslNthInLexRange(zsl,range,offset);
+            ln = zslFirstInLexRange(zsl,range);
+        }
+
+        /* If there is an offset, just traverse the number of elements without
+         * checking the score because that is done in the next loop. */
+        while (ln && offset--) {
+            if (reverse) {
+                ln = ln->backward;
+            } else {
+                ln = ln->level[0].forward;
+            }
         }
 
         while (ln && limit--) {
@@ -3629,7 +3536,7 @@ void zrangebylexCommand(client *c) {
     zrangeGenericCommand(&handler, 1, 0, ZRANGE_LEX, ZRANGE_DIRECTION_FORWARD);
 }
 
-/* ZREVRANGEBYLEX <key> <max> <min> [LIMIT offset count] */
+/* ZREVRANGEBYLEX <key> <min> <max> [LIMIT offset count] */
 void zrevrangebylexCommand(client *c) {
     zrange_result_handler handler;
     zrangeResultHandlerInit(&handler, c, ZRANGE_CONSUMER_TYPE_CLIENT);
@@ -3638,7 +3545,7 @@ void zrevrangebylexCommand(client *c) {
 
 /**
  * This function handles ZRANGE and ZRANGESTORE, and also the deprecated
- * Z[REV]RANGE[BYSCORE|BYLEX] commands.
+ * Z[REV]RANGE[BYPOS|BYLEX] commands.
  *
  * The simple ZRANGE and ZRANGESTORE can take _AUTO in rangetype and direction,
  * other command pass explicit value.
@@ -3694,7 +3601,7 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
         }
     }
 
-    /* Use defaults if not overridden by arguments. */
+    /* Use defaults if not overriden by arguments. */
     if (direction == ZRANGE_DIRECTION_AUTO)
         direction = ZRANGE_DIRECTION_FORWARD;
     if (rangetype == ZRANGE_AUTO)
@@ -3753,14 +3660,11 @@ void zrangeGenericCommand(zrange_result_handler *handler, int argc_start, int st
     }
 
     /* Step 3: Lookup the key and get the range. */
-    zobj = lookupKeyRead(c->db, key);
+    zobj = handler->dstkey ?
+        lookupKeyWrite(c->db,key) :
+        lookupKeyRead(c->db,key);
     if (zobj == NULL) {
-        if (store) {
-            handler->beginResultEmission(handler, -1);
-            handler->finalizeResultEmission(handler, 0);
-        } else {
-            addReply(c, shared.emptyarray);
-        }
+        addReply(c,shared.emptyarray);
         goto cleanup;
     }
 
@@ -3841,43 +3745,17 @@ void zrankGenericCommand(client *c, int reverse) {
     robj *key = c->argv[1];
     robj *ele = c->argv[2];
     robj *zobj;
-    robj* reply;
     long rank;
-    int opt_withscore = 0;
-    double score;
 
-    if (c->argc > 4) {
-        addReplyErrorArity(c);
-        return;
-    }
-    if (c->argc > 3) {
-        if (!strcasecmp(c->argv[3]->ptr, "withscore")) {
-            opt_withscore = 1;
-        } else {
-            addReplyErrorObject(c, shared.syntaxerr);
-            return;
-        }
-    }
-    reply = opt_withscore ? shared.nullarray[c->resp] : shared.null[c->resp];
-    if ((zobj = lookupKeyReadOrReply(c, key, reply)) == NULL || checkType(c, zobj, OBJ_ZSET)) {
-        return;
-    }
-    serverAssertWithInfo(c, ele, sdsEncodedObject(ele));
-    rank = zsetRank(zobj, ele->ptr, reverse, opt_withscore ? &score : NULL);
+    if ((zobj = lookupKeyReadOrReply(c,key,shared.null[c->resp])) == NULL ||
+        checkType(c,zobj,OBJ_ZSET)) return;
+
+    serverAssertWithInfo(c,ele,sdsEncodedObject(ele));
+    rank = zsetRank(zobj,ele->ptr,reverse);
     if (rank >= 0) {
-        if (opt_withscore) {
-            addReplyArrayLen(c, 2);
-        }
-        addReplyLongLong(c, rank);
-        if (opt_withscore) {
-            addReplyDouble(c, score);
-        }
+        addReplyLongLong(c,rank);
     } else {
-        if (opt_withscore) {
-            addReplyNullArray(c);
-        } else {
-            addReplyNull(c);
-        }
+        addReplyNull(c);
     }
 }
 
@@ -3891,7 +3769,7 @@ void zrevrankCommand(client *c) {
 
 void zscanCommand(client *c) {
     robj *o;
-    unsigned long long cursor;
+    unsigned long cursor;
 
     if (parseScanCursorOrReply(c,c->argv[2],&cursor) == C_ERR) return;
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptyscan)) == NULL ||
@@ -3900,35 +3778,31 @@ void zscanCommand(client *c) {
 }
 
 /* This command implements the generic zpop operation, used by:
- * ZPOPMIN, ZPOPMAX, BZPOPMIN, BZPOPMAX and ZMPOP. This function is also used
- * inside blocked.c in the unblocking stage of BZPOPMIN, BZPOPMAX and BZMPOP.
+ * ZPOPMIN, ZPOPMAX, BZPOPMIN and BZPOPMAX. This function is also used
+ * inside blocked.c in the unblocking stage of BZPOPMIN and BZPOPMAX.
  *
  * If 'emitkey' is true also the key name is emitted, useful for the blocking
  * behavior of BZPOP[MIN|MAX], since we can block into multiple keys.
- * Or in ZMPOP/BZMPOP, because we also can take multiple keys.
  *
- * 'count' is the number of elements requested to pop, or -1 for plain single pop.
- *
- * 'use_nested_array' when false it generates a flat array (with or without key name).
- * When true, it generates a nested 2 level array of field + score pairs, or 3 level when emitkey is set.
- *
- * 'reply_nil_when_empty' when true we reply a NIL if we are not able to pop up any elements.
- * Like in ZMPOP/BZMPOP we reply with a structured nested array containing key name
- * and member + score pairs. In these commands, we reply with null when we have no result.
- * Otherwise in ZPOPMIN/ZPOPMAX we reply an empty array by default.
- *
- * 'deleted' is an optional output argument to get an indication
- * if the key got deleted by this function.
- * */
-void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey,
-                        long count, int use_nested_array, int reply_nil_when_empty, int *deleted) {
+ * The synchronous version instead does not need to emit the key, but may
+ * use the 'count' argument to return multiple items if available. */
+void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey, robj *countarg) {
     int idx;
     robj *key = NULL;
     robj *zobj = NULL;
     sds ele;
     double score;
+    long count = 1;
 
-    if (deleted) *deleted = 0;
+    /* If a count argument as passed, parse it or return an error. */
+    if (countarg) {
+        if (getLongFromObjectOrReply(c,countarg,&count,NULL) != C_OK)
+            return;
+        if (count <= 0) {
+            addReply(c,shared.emptyarray);
+            return;
+        }
+    }
 
     /* Check type and break on the first error, otherwise identify candidate. */
     idx = 0;
@@ -3942,48 +3816,19 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
 
     /* No candidate for zpopping, return empty. */
     if (!zobj) {
-        if (reply_nil_when_empty) {
-            addReplyNullArray(c);
-        } else {
-            addReply(c,shared.emptyarray);
-        }
+        addReply(c,shared.emptyarray);
         return;
     }
 
-    if (count == 0) {
-        /* ZPOPMIN/ZPOPMAX with count 0. */
-        addReply(c, shared.emptyarray);
-        return;
-    }
+    void *arraylen_ptr = addReplyDeferredLen(c);
+    long arraylen = 0;
 
-    long result_count = 0;
-
-    /* When count is -1, we need to correct it to 1 for plain single pop. */
-    if (count == -1) count = 1;
-
-    long llen = zsetLength(zobj);
-    long rangelen = (count > llen) ? llen : count;
-
-    if (!use_nested_array && !emitkey) {
-        /* ZPOPMIN/ZPOPMAX with or without COUNT option in RESP2. */
-        addReplyArrayLen(c, rangelen * 2);
-    } else if (use_nested_array && !emitkey) {
-        /* ZPOPMIN/ZPOPMAX with COUNT option in RESP3. */
-        addReplyArrayLen(c, rangelen);
-    } else if (!use_nested_array && emitkey) {
-        /* BZPOPMIN/BZPOPMAX in RESP2 and RESP3. */
-        addReplyArrayLen(c, rangelen * 2 + 1);
-        addReplyBulk(c, key);
-    } else if (use_nested_array && emitkey) {
-        /* ZMPOP/BZMPOP in RESP2 and RESP3. */
-        addReplyArrayLen(c, 2);
-        addReplyBulk(c, key);
-        addReplyArrayLen(c, rangelen);
-    }
+    /* We emit the key only for the blocking variant. */
+    if (emitkey) addReplyBulk(c,key);
 
     /* Remove the element. */
     do {
-        if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
             unsigned char *zl = zobj->ptr;
             unsigned char *eptr, *sptr;
             unsigned char *vstr;
@@ -3991,16 +3836,16 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
             long long vlong;
 
             /* Get the first or last element in the sorted set. */
-            eptr = lpSeek(zl,where == ZSET_MAX ? -2 : 0);
+            eptr = ziplistIndex(zl,where == ZSET_MAX ? -2 : 0);
             serverAssertWithInfo(c,zobj,eptr != NULL);
-            vstr = lpGetValue(eptr,&vlen,&vlong);
+            serverAssertWithInfo(c,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
             else
                 ele = sdsnewlen(vstr,vlen);
 
             /* Get the score. */
-            sptr = lpNext(zl,eptr);
+            sptr = ziplistNext(zl,eptr);
             serverAssertWithInfo(c,zobj,sptr != NULL);
             score = zzlGetScore(sptr);
         } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -4023,123 +3868,71 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
         serverAssertWithInfo(c,zobj,zsetDel(zobj,ele));
         server.dirty++;
 
-        if (result_count == 0) { /* Do this only for the first iteration. */
+        if (arraylen == 0) { /* Do this only for the first iteration. */
             char *events[2] = {"zpopmin","zpopmax"};
             notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
+            signalModifiedKey(c,c->db,key);
         }
 
-        if (use_nested_array) {
-            addReplyArrayLen(c,2);
-        }
         addReplyBulkCBuffer(c,ele,sdslen(ele));
         addReplyDouble(c,score);
         sdsfree(ele);
-        ++result_count;
-    } while(--rangelen);
+        arraylen += 2;
 
-    /* Remove the key, if indeed needed. */
-    if (zsetLength(zobj) == 0) {
-        if (deleted) *deleted = 1;
+        /* Remove the key, if indeed needed. */
+        if (zsetLength(zobj) == 0) {
+            dbDelete(c->db,key);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+            break;
+        }
+    } while(--count);
 
-        dbDelete(c->db,key);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
-        /* No need updateKeysizesHist(). dbDelete() done it already. */
-    } else {
-        updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, llen, llen - result_count);
-    }
-    signalModifiedKey(c,c->db,key);
-
-    if (c->cmd->proc == zmpopCommand) {
-        /* Always replicate it as ZPOP[MIN|MAX] with COUNT option instead of ZMPOP. */
-        robj *count_obj = createStringObjectFromLongLong((count > llen) ? llen : count);
-        rewriteClientCommandVector(c, 3,
-                                   (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
-                                   key, count_obj);
-        decrRefCount(count_obj);
-    }
-}
-
-/* ZPOPMIN/ZPOPMAX key [<count>] */
-void zpopMinMaxCommand(client *c, int where) {
-    if (c->argc > 3) {
-        addReplyErrorObject(c,shared.syntaxerr);
-        return;
-    }
-
-    long count = -1; /* -1 for plain single pop. */
-    if (c->argc == 3 && getPositiveLongFromObjectOrReply(c, c->argv[2], &count, NULL) != C_OK)
-        return;
-
-    /* Respond with a single (flat) array in RESP2 or if count is -1
-     * (returning a single element). In RESP3, when count > 0 use nested array. */
-    int use_nested_array = (c->resp > 2 && count != -1);
-
-    genericZpopCommand(c, &c->argv[1], 1, where, 0, count, use_nested_array, 0, NULL);
+    setDeferredArrayLen(c,arraylen_ptr,arraylen + (emitkey != 0));
 }
 
 /* ZPOPMIN key [<count>] */
 void zpopminCommand(client *c) {
-    zpopMinMaxCommand(c, ZSET_MIN);
+    if (c->argc > 3) {
+        addReplyErrorObject(c,shared.syntaxerr);
+        return;
+    }
+    genericZpopCommand(c,&c->argv[1],1,ZSET_MIN,0,
+        c->argc == 3 ? c->argv[2] : NULL);
 }
 
-/* ZPOPMAX key [<count>] */
+/* ZMAXPOP key [<count>] */
 void zpopmaxCommand(client *c) {
-    zpopMinMaxCommand(c, ZSET_MAX);
+    if (c->argc > 3) {
+        addReplyErrorObject(c,shared.syntaxerr);
+        return;
+    }
+    genericZpopCommand(c,&c->argv[1],1,ZSET_MAX,0,
+        c->argc == 3 ? c->argv[2] : NULL);
 }
 
-/* BZPOPMIN, BZPOPMAX, BZMPOP actual implementation.
- *
- * 'numkeys' is the number of keys.
- *
- * 'timeout_idx' parameter position of block timeout.
- *
- * 'where' ZSET_MIN or ZSET_MAX.
- *
- * 'count' is the number of elements requested to pop, or -1 for plain single pop.
- *
- * 'use_nested_array' when false it generates a flat array (with or without key name).
- * When true, it generates a nested 3 level array of keyname, field + score pairs.
- * */
-void blockingGenericZpopCommand(client *c, robj **keys, int numkeys, int where,
-                                int timeout_idx, long count, int use_nested_array, int reply_nil_when_empty) {
+/* BZPOPMIN / BZPOPMAX actual implementation. */
+void blockingGenericZpopCommand(client *c, int where) {
     robj *o;
-    robj *key;
     mstime_t timeout;
     int j;
 
-    if (getTimeoutFromObjectOrReply(c,c->argv[timeout_idx],&timeout,UNIT_SECONDS)
+    if (getTimeoutFromObjectOrReply(c,c->argv[c->argc-1],&timeout,UNIT_SECONDS)
         != C_OK) return;
 
-    for (j = 0; j < numkeys; j++) {
-        key = keys[j];
-        o = lookupKeyWrite(c->db,key);
-        /* Non-existing key, move to next key. */
-        if (o == NULL) continue;
-
+    for (j = 1; j < c->argc-1; j++) {
+        o = lookupKeyWrite(c->db,c->argv[j]);
         if (checkType(c,o,OBJ_ZSET)) return;
-
-        long llen = zsetLength(o);
-        /* Empty zset, move to next key. */
-        if (llen == 0) continue;
-
-        /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
-        genericZpopCommand(c, &key, 1, where, 1, count, use_nested_array, reply_nil_when_empty, NULL);
-
-        if (count == -1) {
-            /* Replicate it as ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
-            rewriteClientCommandVector(c,2,
-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
-                                       key);
-        } else {
-            /* Replicate it as ZPOP[MIN|MAX] with COUNT option. */
-            robj *count_obj = createStringObjectFromLongLong((count > llen) ? llen : count);
-            rewriteClientCommandVector(c, 3,
-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
-                                       key, count_obj);
-            decrRefCount(count_obj);
+        if (o != NULL) {
+            if (zsetLength(o) != 0) {
+                /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
+                genericZpopCommand(c,&c->argv[j],1,where,1,NULL);
+                /* Replicate it as an ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
+                rewriteClientCommandVector(c,2,
+                    where == ZSET_MAX ? shared.zpopmax : shared.zpopmin,
+                    c->argv[j]);
+                return;
+            }
         }
-
-        return;
     }
 
     /* If we are not allowed to block the client and the zset is empty the only thing
@@ -4150,20 +3943,20 @@ void blockingGenericZpopCommand(client *c, robj **keys, int numkeys, int where,
     }
 
     /* If the keys do not exist we must block */
-    blockForKeys(c,BLOCKED_ZSET,keys,numkeys,timeout,0);
+    blockForKeys(c,BLOCKED_ZSET,c->argv + 1,c->argc - 2,timeout,NULL,NULL,NULL);
 }
 
 // BZPOPMIN key [key ...] timeout
 void bzpopminCommand(client *c) {
-    blockingGenericZpopCommand(c, c->argv+1, c->argc-2, ZSET_MIN, c->argc-1, -1, 0, 0);
+    blockingGenericZpopCommand(c,ZSET_MIN);
 }
 
 // BZPOPMAX key [key ...] timeout
 void bzpopmaxCommand(client *c) {
-    blockingGenericZpopCommand(c, c->argv+1, c->argc-2, ZSET_MAX, c->argc-1, -1, 0, 0);
+    blockingGenericZpopCommand(c,ZSET_MAX);
 }
 
-static void zrandmemberReplyWithListpack(client *c, unsigned int count, listpackEntry *keys, listpackEntry *vals) {
+static void zarndmemberReplyWithZiplist(client *c, unsigned int count, ziplistEntry *keys, ziplistEntry *vals) {
     for (unsigned long i = 0; i < count; i++) {
         if (vals && c->resp > 2)
             addReplyArrayLen(c,2);
@@ -4195,7 +3988,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
     int uniq = 1;
     robj *zsetobj;
 
-    if ((zsetobj = lookupKeyReadOrReply(c, c->argv[1], shared.emptyarray))
+    if ((zsetobj = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp]))
         == NULL || checkType(c, zsetobj, OBJ_ZSET)) return;
     size = zsetLength(zsetobj);
 
@@ -4231,24 +4024,20 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
                     addReplyArrayLen(c,2);
                 addReplyBulkCBuffer(c, key, sdslen(key));
                 if (withscores)
-                    addReplyDouble(c, *(double*)dictGetVal(de));
-                if (c->flags & CLIENT_CLOSE_ASAP)
-                    break;
+                    addReplyDouble(c, dictGetDoubleVal(de));
             }
-        } else if (zsetobj->encoding == OBJ_ENCODING_LISTPACK) {
-            listpackEntry *keys, *vals = NULL;
+        } else if (zsetobj->encoding == OBJ_ENCODING_ZIPLIST) {
+            ziplistEntry *keys, *vals = NULL;
             unsigned long limit, sample_count;
             limit = count > ZRANDMEMBER_RANDOM_SAMPLE_LIMIT ? ZRANDMEMBER_RANDOM_SAMPLE_LIMIT : count;
-            keys = zmalloc(sizeof(listpackEntry)*limit);
+            keys = zmalloc(sizeof(ziplistEntry)*limit);
             if (withscores)
-                vals = zmalloc(sizeof(listpackEntry)*limit);
+                vals = zmalloc(sizeof(ziplistEntry)*limit);
             while (count) {
                 sample_count = count > limit ? limit : count;
                 count -= sample_count;
-                lpRandomPairs(zsetobj->ptr, sample_count, keys, vals, 2);
-                zrandmemberReplyWithListpack(c, sample_count, keys, vals);
-                if (c->flags & CLIENT_CLOSE_ASAP)
-                    break;
+                ziplistRandomPairs(zsetobj->ptr, sample_count, keys, vals);
+                zarndmemberReplyWithZiplist(c, sample_count, keys, vals);
             }
             zfree(keys);
             zfree(vals);
@@ -4282,28 +4071,6 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
             if (withscores)
                 addReplyDouble(c, zval.score);
         }
-        zuiClearIterator(&src);
-        return;
-    }
-
-    /* CASE 2.5 listpack only. Sampling unique elements, in non-random order.
-     * Listpack encoded zsets are meant to be relatively small, so
-     * ZRANDMEMBER_SUB_STRATEGY_MUL isn't necessary and we rather not make
-     * copies of the entries. Instead, we emit them directly to the output
-     * buffer.
-     *
-     * And it is inefficient to repeatedly pick one random element from a
-     * listpack in CASE 4. So we use this instead. */
-    if (zsetobj->encoding == OBJ_ENCODING_LISTPACK) {
-        listpackEntry *keys, *vals = NULL;
-        keys = zmalloc(sizeof(listpackEntry)*count);
-        if (withscores)
-            vals = zmalloc(sizeof(listpackEntry)*count);
-        serverAssert(lpRandomPairsUnique(zsetobj->ptr, count, keys, vals, 2) == count);
-        zrandmemberReplyWithListpack(c, count, keys, vals);
-        zfree(keys);
-        zfree(vals);
-        zuiClearIterator(&src);
         return;
     }
 
@@ -4317,8 +4084,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      * a bit less than the number of elements in the set, the natural approach
      * used into CASE 4 is highly inefficient. */
     if (count*ZRANDMEMBER_SUB_STRATEGY_MUL > size) {
-        /* Hashtable encoding (generic implementation) */
-        dict *d = dictCreate(&sdsReplyDictType);
+        dict *d = dictCreate(&sdsReplyDictType, NULL);
         dictExpand(d, size);
         /* Add all the elements into the temporary dictionary. */
         while (zuiNext(&src, &zval)) {
@@ -4333,7 +4099,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         /* Remove random elements to reach the right count. */
         while (size > count) {
             dictEntry *de;
-            de = dictGetFairRandomKey(d);
+            de = dictGetRandomKey(d);
             dictUnlink(d,dictGetKey(de));
             sdsfree(dictGetKey(de));
             dictFreeUnlinkedEntry(d,de);
@@ -4361,20 +4127,34 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
      * to the temporary set, trying to eventually get enough unique elements
      * to reach the specified count. */
     else {
+        if (zsetobj->encoding == OBJ_ENCODING_ZIPLIST) {
+            /* it is inefficient to repeatedly pick one random element from a
+             * ziplist. so we use this instead: */
+            ziplistEntry *keys, *vals = NULL;
+            keys = zmalloc(sizeof(ziplistEntry)*count);
+            if (withscores)
+                vals = zmalloc(sizeof(ziplistEntry)*count);
+            serverAssert(ziplistRandomPairsUnique(zsetobj->ptr, count, keys, vals) == count);
+            zarndmemberReplyWithZiplist(c, count, keys, vals);
+            zfree(keys);
+            zfree(vals);
+            return;
+        }
+
         /* Hashtable encoding (generic implementation) */
         unsigned long added = 0;
-        dict *d = dictCreate(&hashDictType);
+        dict *d = dictCreate(&hashDictType, NULL);
         dictExpand(d, count);
 
         while (added < count) {
-            listpackEntry key;
+            ziplistEntry key;
             double score;
             zsetTypeRandomElement(zsetobj, size, &key, withscores ? &score: NULL);
 
             /* Try to add the object to the dictionary. If it already exists
             * free it, otherwise increment the number of objects we have
             * in the result dictionary. */
-            sds skey = zsetSdsFromListpackEntry(&key);
+            sds skey = zsetSdsFromZiplistEntry(&key);
             if (dictAdd(d,skey,NULL) != DICT_OK) {
                 sdsfree(skey);
                 continue;
@@ -4383,7 +4163,7 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
 
             if (withscores && c->resp > 2)
                 addReplyArrayLen(c,2);
-            zsetReplyFromListpackEntry(c, &key);
+            zsetReplyFromZiplistEntry(c, &key);
             if (withscores)
                 addReplyDouble(c, score);
         }
@@ -4391,28 +4171,22 @@ void zrandmemberWithCountCommand(client *c, long l, int withscores) {
         /* Release memory */
         dictRelease(d);
     }
-    zuiClearIterator(&src);
 }
 
-/* ZRANDMEMBER key [<count> [WITHSCORES]] */
+/* ZRANDMEMBER [<count> WITHSCORES] */
 void zrandmemberCommand(client *c) {
     long l;
     int withscores = 0;
     robj *zset;
-    listpackEntry ele;
+    ziplistEntry ele;
 
     if (c->argc >= 3) {
-        if (getRangeLongFromObjectOrReply(c,c->argv[2],-LONG_MAX,LONG_MAX,&l,NULL) != C_OK) return;
+        if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
         if (c->argc > 4 || (c->argc == 4 && strcasecmp(c->argv[3]->ptr,"withscores"))) {
             addReplyErrorObject(c,shared.syntaxerr);
             return;
-        } else if (c->argc == 4) {
+        } else if (c->argc == 4)
             withscores = 1;
-            if (l < -LONG_MAX/2 || l > LONG_MAX/2) {
-                addReplyError(c,"value is out of range");
-                return;
-            }
-        }
         zrandmemberWithCountCommand(c, l, withscores);
         return;
     }
@@ -4424,72 +4198,5 @@ void zrandmemberCommand(client *c) {
     }
 
     zsetTypeRandomElement(zset, zsetLength(zset), &ele,NULL);
-    zsetReplyFromListpackEntry(c,&ele);
-}
-
-/* ZMPOP/BZMPOP
- *
- * 'numkeys_idx' parameter position of key number.
- * 'is_block' this indicates whether it is a blocking variant. */
-void zmpopGenericCommand(client *c, int numkeys_idx, int is_block) {
-    long j;
-    long numkeys = 0;      /* Number of keys. */
-    int where = 0;         /* ZSET_MIN or ZSET_MAX. */
-    long count = -1;       /* Reply will consist of up to count elements, depending on the zset's length. */
-
-    /* Parse the numkeys. */
-    if (getRangeLongFromObjectOrReply(c, c->argv[numkeys_idx], 1, LONG_MAX,
-                                      &numkeys, "numkeys should be greater than 0") != C_OK)
-        return;
-
-    /* Parse the where. where_idx: the index of where in the c->argv. */
-    long where_idx = numkeys_idx + numkeys + 1;
-    if (where_idx >= c->argc) {
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
-    }
-    if (!strcasecmp(c->argv[where_idx]->ptr, "MIN")) {
-        where = ZSET_MIN;
-    } else if (!strcasecmp(c->argv[where_idx]->ptr, "MAX")) {
-        where = ZSET_MAX;
-    } else {
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
-    }
-
-    /* Parse the optional arguments. */
-    for (j = where_idx + 1; j < c->argc; j++) {
-        char *opt = c->argv[j]->ptr;
-        int moreargs = (c->argc - 1) - j;
-
-        if (count == -1 && !strcasecmp(opt, "COUNT") && moreargs) {
-            j++;
-            if (getRangeLongFromObjectOrReply(c, c->argv[j], 1, LONG_MAX,
-                                              &count,"count should be greater than 0") != C_OK)
-                return;
-        } else {
-            addReplyErrorObject(c, shared.syntaxerr);
-            return;
-        }
-    }
-
-    if (count == -1) count = 1;
-
-    if (is_block) {
-        /* BLOCK. We will handle CLIENT_DENY_BLOCKING flag in blockingGenericZpopCommand. */
-        blockingGenericZpopCommand(c, c->argv+numkeys_idx+1, numkeys, where, 1, count, 1, 1);
-    } else {
-        /* NON-BLOCK */
-        genericZpopCommand(c, c->argv+numkeys_idx+1, numkeys, where, 1, count, 1, 1, NULL);
-    }
-}
-
-/* ZMPOP numkeys key [<key> ...] MIN|MAX [COUNT count] */
-void zmpopCommand(client *c) {
-    zmpopGenericCommand(c, 1, 0);
-}
-
-/* BZMPOP timeout numkeys key [<key> ...] MIN|MAX [COUNT count] */
-void bzmpopCommand(client *c) {
-    zmpopGenericCommand(c, 2, 1);
+    zsetReplyFromZiplistEntry(c,&ele);
 }

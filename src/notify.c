@@ -1,15 +1,36 @@
 /*
- * Copyright (c) 2013-Present, Redis Ltd.
+ * Copyright (c) 2013, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "server.h"
 
 /* This file implements keyspace events notification via Pub/Sub and
- * described at https://redis.io/docs/latest/develop/use/keyspace-notifications/. */
+ * described at https://redis.io/topics/notifications. */
 
 /* Turn a string representing notification classes into an integer
  * representing notification classes flags xored.
@@ -35,8 +56,6 @@ int keyspaceEventsStringToFlags(char *classes) {
         case 'E': flags |= NOTIFY_KEYEVENT; break;
         case 't': flags |= NOTIFY_STREAM; break;
         case 'm': flags |= NOTIFY_KEY_MISS; break;
-        case 'd': flags |= NOTIFY_MODULE; break;
-        case 'n': flags |= NOTIFY_NEW; break;
         default: return -1;
         }
     }
@@ -63,8 +82,6 @@ sds keyspaceEventsFlagsToString(int flags) {
         if (flags & NOTIFY_EXPIRED) res = sdscatlen(res,"x",1);
         if (flags & NOTIFY_EVICTED) res = sdscatlen(res,"e",1);
         if (flags & NOTIFY_STREAM) res = sdscatlen(res,"t",1);
-        if (flags & NOTIFY_MODULE) res = sdscatlen(res,"d",1);
-        if (flags & NOTIFY_NEW) res = sdscatlen(res,"n",1);
     }
     if (flags & NOTIFY_KEYSPACE) res = sdscatlen(res,"K",1);
     if (flags & NOTIFY_KEYEVENT) res = sdscatlen(res,"E",1);
@@ -74,13 +91,12 @@ sds keyspaceEventsFlagsToString(int flags) {
 
 /* The API provided to the rest of the Redis core is a simple function:
  *
- * notifyKeyspaceEvent(int type, char *event, robj *key, int dbid);
+ * notifyKeyspaceEvent(char *event, robj *key, int dbid);
  *
- * 'type' is the notification class we define in `server.h`.
  * 'event' is a C string representing the event name.
  * 'key' is a Redis object representing the key name.
  * 'dbid' is the database ID where the key lives.  */
-void notifyKeyspaceEvent(int type, const char *event, robj *key, int dbid) {
+void notifyKeyspaceEvent(int type, char *event, robj *key, int dbid) {
     sds chan;
     robj *chanobj, *eventobj;
     int len = -1;
@@ -105,7 +121,7 @@ void notifyKeyspaceEvent(int type, const char *event, robj *key, int dbid) {
         chan = sdscatlen(chan, "__:", 3);
         chan = sdscatsds(chan, key->ptr);
         chanobj = createObject(OBJ_STRING, chan);
-        pubsubPublishMessage(chanobj, eventobj, 0);
+        pubsubPublishMessage(chanobj, eventobj);
         decrRefCount(chanobj);
     }
 
@@ -117,7 +133,7 @@ void notifyKeyspaceEvent(int type, const char *event, robj *key, int dbid) {
         chan = sdscatlen(chan, "__:", 3);
         chan = sdscatsds(chan, eventobj->ptr);
         chanobj = createObject(OBJ_STRING, chan);
-        pubsubPublishMessage(chanobj, key, 0);
+        pubsubPublishMessage(chanobj, key);
         decrRefCount(chanobj);
     }
     decrRefCount(eventobj);

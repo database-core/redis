@@ -1,7 +1,7 @@
 # Failover stress test.
 # In this test a different node is killed in a loop for N
 # iterations. The test checks that certain properties
-# are preserved across iterations.
+# are preseved across iterations.
 
 source "../tests/includes/init-tests.tcl"
 
@@ -61,9 +61,7 @@ while {[incr iterations -1]} {
         }
     }
 
-    test "Terminating node #$tokill" {
-        # Stop AOF so that an initial AOFRW won't prevent the instance from terminating
-        R $tokill config set appendonly no
+    test "Killing node #$tokill" {
         kill_instance redis $tokill
     }
 

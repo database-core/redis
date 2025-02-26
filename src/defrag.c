@@ -5,134 +5,48 @@
  * We do that by scanning the keyspace and for each pointer we have, we can try to
  * ask the allocator if moving it to a new address will help reduce fragmentation.
  *
- * Copyright (c) 2020-Present, Redis Ltd.
+ * Copyright (c) 2020, Redis Labs, Inc
  * All rights reserved.
  *
- * Copyright (c) 2024-present, Valkey contributors.
- * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
  *
- * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "server.h"
+#include <time.h>
+#include <assert.h>
 #include <stddef.h>
-#include <math.h>
 
 #ifdef HAVE_DEFRAG
-
-#define DEFRAG_CYCLE_US 500 /* Standard duration of defrag cycle (in microseconds) */
-
-typedef enum { DEFRAG_NOT_DONE = 0,
-               DEFRAG_DONE = 1 } doneStatus;
-
-/*
- * Defragmentation is performed in stages. Each stage is serviced by a stage function
- * (defragStageFn). The stage function is passed a context (void*) to defrag. The contents of that
- * context are unique to the particular stage - and may even be NULL for some stage functions. The
- * same stage function can be used multiple times (for different stages) each having a different
- * context.
- *
- * Parameters:
- *  endtime     - This is the monotonic time that the function should end and return. This ensures
- *                a bounded latency due to defrag.
- *  ctx         - A pointer to context which is unique to the stage function.
- *
- * Returns:
- *  - DEFRAG_DONE if the stage is complete
- *  - DEFRAG_NOT_DONE if there is more work to do
- */
-typedef doneStatus (*defragStageFn)(void *ctx, monotime endtime);
-
-/* Function pointer type for freeing context in defragmentation stages. */
-typedef void (*defragStageContextFreeFn)(void *ctx);
-typedef struct {
-    defragStageFn stage_fn; /* The function to be invoked for the stage */
-    defragStageContextFreeFn ctx_free_fn; /* Function to free the context */
-    void *ctx; /* Context, unique to the stage function */
-} StageDescriptor;
-
-/* Globals needed for the main defrag processing logic.
- * Doesn't include variables specific to a stage or type of data. */
-struct DefragContext {
-    monotime start_cycle;           /* Time of beginning of defrag cycle */
-    long long start_defrag_hits;    /* server.stat_active_defrag_hits captured at beginning of cycle */
-    long long start_defrag_misses;  /* server.stat_active_defrag_misses captured at beginning of cycle */
-    float start_frag_pct;           /* Fragmention percent of beginning of defrag cycle */
-    float decay_rate;               /* Defrag speed decay rate */
-
-    list *remaining_stages;         /* List of stages which remain to be processed */
-    listNode *current_stage;        /* The list node of stage that's currently being processed */
-
-    long long timeproc_id;      /* Eventloop ID of the timerproc (or AE_DELETED_EVENT_ID) */
-    monotime timeproc_end_time; /* Ending time of previous timerproc execution */
-    long timeproc_overage_us;   /* A correction value if over target CPU percent */
-};
-static struct DefragContext defrag = {0, 0, 0, 0, 1.0f};
-
-/* There are a number of stages which process a kvstore. To simplify this, a stage helper function
- * `defragStageKvstoreHelper()` is defined. This function aids in iterating over the kvstore. It
- * uses these definitions.
- */
-/* State of the kvstore helper. The context passed to the kvstore helper MUST BEGIN
- * with a kvstoreIterState (or be passed as NULL). */
-#define KVS_SLOT_DEFRAG_LUT -2
-#define KVS_SLOT_UNASSIGNED -1
-typedef struct {
-    kvstore *kvs;
-    int slot;
-    unsigned long cursor;
-} kvstoreIterState;
-#define INIT_KVSTORE_STATE(kvs) ((kvstoreIterState){(kvs), KVS_SLOT_DEFRAG_LUT, 0})
-
-/* The kvstore helper uses this function to perform tasks before continuing the iteration. For the
- * main dictionary, large items are set aside and processed by this function before continuing with
- * iteration over the kvstore.
- *  endtime     - This is the monotonic time that the function should end and return.
- *  ctx         - Context for functions invoked by the helper. If provided in the call to
- *                `defragStageKvstoreHelper()`, the `kvstoreIterState` portion (at the beginning)
- *                will be updated with the current kvstore iteration status.
- *
- * Returns:
- *  - DEFRAG_DONE if the pre-continue work is complete
- *  - DEFRAG_NOT_DONE if there is more work to do
- */
-typedef doneStatus (*kvstoreHelperPreContinueFn)(void *ctx, monotime endtime);
-
-typedef struct {
-    kvstoreIterState kvstate;
-    int dbid;
-
-    /* When scanning a main kvstore, large elements are queued for later handling rather than
-     * causing a large latency spike while processing a hash table bucket. This list is only used
-     * for stage: "defragStageDbKeys". It will only contain values for the current kvstore being
-     * defragged.
-     * Note that this is a list of key names. It's possible that the key may be deleted or modified
-     * before "later" and we will search by key name to find the entry when we defrag the item later. */
-    list *defrag_later;
-    unsigned long defrag_later_cursor;
-} defragKeysCtx;
-static_assert(offsetof(defragKeysCtx, kvstate) == 0, "defragStageKvstoreHelper requires this");
-
-/* Context for pubsub kvstores */
-typedef dict *(*getClientChannelsFn)(client *);
-typedef struct {
-    kvstoreIterState kvstate;
-    getClientChannelsFn getPubSubChannels;
-} defragPubSubCtx;
-static_assert(offsetof(defragPubSubCtx, kvstate) == 0, "defragStageKvstoreHelper requires this");
-
-typedef struct {
-    sds module_name;
-    RedisModuleDefragCtx *module_ctx;
-    unsigned long cursor;
-} defragModuleCtx;
 
 /* this method was added to jemalloc in order to help us understand which
  * pointers are worthwhile moving and which aren't */
 int je_get_defrag_hint(void* ptr);
+
+/* forward declarations*/
+void defragDictBucketCallback(void *privdata, dictEntry **bucketref);
+dictEntry* replaceSatelliteDictKeyPtrAndOrDefragDictEntry(dict *d, sds oldkey, sds newkey, uint64_t hash, long *defragged);
 
 /* Defrag helper for generic allocations.
  *
@@ -149,23 +63,11 @@ void* activeDefragAlloc(void *ptr) {
     /* move this allocation to a new allocation.
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
-    size = zmalloc_usable_size(ptr);
+    size = zmalloc_size(ptr);
     newptr = zmalloc_no_tcache(size);
     memcpy(newptr, ptr, size);
     zfree_no_tcache(ptr);
-    server.stat_active_defrag_hits++;
     return newptr;
-}
-
-/* Raw memory allocation for defrag, avoid using tcache. */
-void *activeDefragAllocRaw(size_t size) {
-    return zmalloc_no_tcache(size);
-}
-
-/* Raw memory free for defrag, avoid using tcache. */
-void activeDefragFreeRaw(void *ptr) {
-    zfree_no_tcache(ptr);
-    server.stat_active_defrag_hits++;
 }
 
 /*Defrag helper for sds strings
@@ -184,38 +86,21 @@ sds activeDefragSds(sds sdsptr) {
     return NULL;
 }
 
-/* Defrag helper for hfield strings
+/* Defrag helper for robj and/or string objects
  *
  * returns NULL in case the allocation wasn't moved.
  * when it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
-hfield activeDefragHfield(hfield hf) {
-    void *ptr = hfieldGetAllocPtr(hf);
-    void *newptr = activeDefragAlloc(ptr);
-    if (newptr) {
-        size_t offset = hf - (char*)ptr;
-        hf = (char*)newptr + offset;
-        return hf;
-    }
-    return NULL;
-}
-
-/* Defrag helper for robj and/or string objects with expected refcount.
- *
- * Like activeDefragStringOb, but it requires the caller to pass in the expected
- * reference count. In some cases, the caller needs to update a robj whose
- * reference count is not 1, in these cases, the caller must explicitly pass
- * in the reference count, otherwise defragmentation will not be performed.
- * Note that the caller is responsible for updating any other references to the robj. */
-robj *activeDefragStringObEx(robj* ob, int expected_refcount) {
+robj *activeDefragStringOb(robj* ob, long *defragged) {
     robj *ret = NULL;
-    if (ob->refcount!=expected_refcount)
+    if (ob->refcount!=1)
         return NULL;
 
     /* try to defrag robj (only if not an EMBSTR type (handled below). */
     if (ob->type!=OBJ_STRING || ob->encoding!=OBJ_ENCODING_EMBSTR) {
         if ((ret = activeDefragAlloc(ob))) {
             ob = ret;
+            (*defragged)++;
         }
     }
 
@@ -225,6 +110,7 @@ robj *activeDefragStringObEx(robj* ob, int expected_refcount) {
             sds newsds = activeDefragSds((sds)ob->ptr);
             if (newsds) {
                 ob->ptr = newsds;
+                (*defragged)++;
             }
         } else if (ob->encoding==OBJ_ENCODING_EMBSTR) {
             /* The sds is embedded in the object allocation, calculate the
@@ -232,6 +118,7 @@ robj *activeDefragStringObEx(robj* ob, int expected_refcount) {
             long ofs = (intptr_t)ob->ptr - (intptr_t)ob;
             if ((ret = activeDefragAlloc(ob))) {
                 ret->ptr = (void*)((intptr_t)ret + ofs);
+                (*defragged)++;
             }
         } else if (ob->encoding!=OBJ_ENCODING_INT) {
             serverPanic("Unknown string encoding");
@@ -240,60 +127,54 @@ robj *activeDefragStringObEx(robj* ob, int expected_refcount) {
     return ret;
 }
 
-/* Defrag helper for robj and/or string objects
- *
- * returns NULL in case the allocation wasn't moved.
- * when it returns a non-null value, the old pointer was already released
- * and should NOT be accessed. */
-robj *activeDefragStringOb(robj* ob) {
-    return activeDefragStringObEx(ob, 1);
-}
-
-/* Defrag helper for lua scripts
- *
- * returns NULL in case the allocation wasn't moved.
- * when it returns a non-null value, the old pointer was already released
- * and should NOT be accessed. */
-luaScript *activeDefragLuaScript(luaScript *script) {
-    luaScript *ret = NULL;
-
-    /* try to defrag script struct */
-    if ((ret = activeDefragAlloc(script))) {
-        script = ret;
+/* Defrag helper for dictEntries to be used during dict iteration (called on
+ * each step). Returns a stat of how many pointers were moved. */
+long dictIterDefragEntry(dictIterator *iter) {
+    /* This function is a little bit dirty since it messes with the internals
+     * of the dict and it's iterator, but the benefit is that it is very easy
+     * to use, and require no other changes in the dict. */
+    long defragged = 0;
+    dictht *ht;
+    /* Handle the next entry (if there is one), and update the pointer in the
+     * current entry. */
+    if (iter->nextEntry) {
+        dictEntry *newde = activeDefragAlloc(iter->nextEntry);
+        if (newde) {
+            defragged++;
+            iter->nextEntry = newde;
+            iter->entry->next = newde;
+        }
     }
-
-    /* try to defrag actual script object */
-    robj *ob = activeDefragStringOb(script->body);
-    if (ob) script->body = ob;
-
-    return ret;
+    /* handle the case of the first entry in the hash bucket. */
+    ht = &iter->d->ht[iter->table];
+    if (ht->table[iter->index] == iter->entry) {
+        dictEntry *newde = activeDefragAlloc(iter->entry);
+        if (newde) {
+            iter->entry = newde;
+            ht->table[iter->index] = newde;
+            defragged++;
+        }
+    }
+    return defragged;
 }
 
 /* Defrag helper for dict main allocations (dict struct, and hash tables).
- * Receives a pointer to the dict* and return a new dict* when the dict
- * struct itself was moved.
- * 
- * Returns NULL in case the allocation wasn't moved.
- * When it returns a non-null value, the old pointer was already released
- * and should NOT be accessed. */
-dict *dictDefragTables(dict *d) {
-    dict *ret = NULL;
+ * receives a pointer to the dict* and implicitly updates it when the dict
+ * struct itself was moved. Returns a stat of how many pointers were moved. */
+long dictDefragTables(dict* d) {
     dictEntry **newtable;
-    /* handle the dict struct */
-    if ((ret = activeDefragAlloc(d)))
-        d = ret;
+    long defragged = 0;
     /* handle the first hash table */
-    if (!d->ht_table[0]) return ret; /* created but unused */
-    newtable = activeDefragAlloc(d->ht_table[0]);
+    newtable = activeDefragAlloc(d->ht[0].table);
     if (newtable)
-        d->ht_table[0] = newtable;
+        defragged++, d->ht[0].table = newtable;
     /* handle the second hash table */
-    if (d->ht_table[1]) {
-        newtable = activeDefragAlloc(d->ht_table[1]);
+    if (d->ht[1].table) {
+        newtable = activeDefragAlloc(d->ht[1].table);
         if (newtable)
-            d->ht_table[1] = newtable;
+            defragged++, d->ht[1].table = newtable;
     }
-    return ret;
+    return defragged;
 }
 
 /* Internal function used by zslDefrag */
@@ -357,89 +238,170 @@ double *zslDefrag(zskiplist *zsl, double score, sds oldele, sds newele) {
 
 /* Defrag helper for sorted set.
  * Defrag a single dict entry key name, and corresponding skiplist struct */
-void activeDefragZsetEntry(zset *zs, dictEntry *de) {
+long activeDefragZsetEntry(zset *zs, dictEntry *de) {
     sds newsds;
     double* newscore;
+    long defragged = 0;
     sds sdsele = dictGetKey(de);
     if ((newsds = activeDefragSds(sdsele)))
-        dictSetKey(zs->dict, de, newsds);
+        defragged++, de->key = newsds;
     newscore = zslDefrag(zs->zsl, *(double*)dictGetVal(de), sdsele, newsds);
     if (newscore) {
         dictSetVal(zs->dict, de, newscore);
+        defragged++;
     }
+    return defragged;
 }
 
 #define DEFRAG_SDS_DICT_NO_VAL 0
 #define DEFRAG_SDS_DICT_VAL_IS_SDS 1
 #define DEFRAG_SDS_DICT_VAL_IS_STROB 2
 #define DEFRAG_SDS_DICT_VAL_VOID_PTR 3
-#define DEFRAG_SDS_DICT_VAL_LUA_SCRIPT 4
-
-void activeDefragSdsDictCallback(void *privdata, const dictEntry *de) {
-    UNUSED(privdata);
-    UNUSED(de);
-}
-
-void activeDefragHfieldDictCallback(void *privdata, const dictEntry *de) {
-    dict *d = privdata;
-    hfield newhf, hf = dictGetKey(de);
-
-    if (hfieldGetExpireTime(hf) == EB_EXPIRE_TIME_INVALID) {
-        /* If the hfield does not have TTL, we directly defrag it. */
-        newhf = activeDefragHfield(hf);
-    } else {
-        /* Update its reference in the ebucket while defragging it. */
-        ebuckets *eb = hashTypeGetDictMetaHFE(d);
-        newhf = ebDefragItem(eb, &hashFieldExpireBucketsType, hf, (ebDefragFunction *)activeDefragHfield);
-    }
-    if (newhf) {
-        /* We can't search in dict for that key after we've released
-         * the pointer it holds, since it won't be able to do the string
-         * compare, but we can find the entry using key hash and pointer. */
-        dictUseStoredKeyApi(d, 1);
-        uint64_t hash = dictGetHash(d, newhf);
-        dictUseStoredKeyApi(d, 0);
-        dictEntry *de = dictFindByHashAndPtr(d, hf, hash);
-        serverAssert(de);
-        dictSetKey(d, de, newhf);
-    }
-}
 
 /* Defrag a dict with sds key and optional value (either ptr, sds or robj string) */
-void activeDefragSdsDict(dict* d, int val_type) {
-    unsigned long cursor = 0;
-    dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = (dictDefragAllocFunction *)activeDefragSds,
-        .defragVal = (val_type == DEFRAG_SDS_DICT_VAL_IS_SDS ? (dictDefragAllocFunction *)activeDefragSds :
-                      val_type == DEFRAG_SDS_DICT_VAL_IS_STROB ? (dictDefragAllocFunction *)activeDefragStringOb :
-                      val_type == DEFRAG_SDS_DICT_VAL_VOID_PTR ? (dictDefragAllocFunction *)activeDefragAlloc :
-                      val_type == DEFRAG_SDS_DICT_VAL_LUA_SCRIPT ? (dictDefragAllocFunction *)activeDefragLuaScript :
-                      NULL)
-    };
-    do {
-        cursor = dictScanDefrag(d, cursor, activeDefragSdsDictCallback,
-                                &defragfns, NULL);
-    } while (cursor != 0);
-}
-
-/* Defrag a dict with hfield key and sds value. */
-void activeDefragHfieldDict(dict *d) {
-    unsigned long cursor = 0;
-    dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = NULL, /* Will be defragmented in activeDefragHfieldDictCallback. */
-        .defragVal = (dictDefragAllocFunction *)activeDefragSds
-    };
-    do {
-        cursor = dictScanDefrag(d, cursor, activeDefragHfieldDictCallback,
-                                &defragfns, d);
-    } while (cursor != 0);
+long activeDefragSdsDict(dict* d, int val_type) {
+    dictIterator *di;
+    dictEntry *de;
+    long defragged = 0;
+    di = dictGetIterator(d);
+    while((de = dictNext(di)) != NULL) {
+        sds sdsele = dictGetKey(de), newsds;
+        if ((newsds = activeDefragSds(sdsele)))
+            de->key = newsds, defragged++;
+        /* defrag the value */
+        if (val_type == DEFRAG_SDS_DICT_VAL_IS_SDS) {
+            sdsele = dictGetVal(de);
+            if ((newsds = activeDefragSds(sdsele)))
+                de->v.val = newsds, defragged++;
+        } else if (val_type == DEFRAG_SDS_DICT_VAL_IS_STROB) {
+            robj *newele, *ele = dictGetVal(de);
+            if ((newele = activeDefragStringOb(ele, &defragged)))
+                de->v.val = newele;
+        } else if (val_type == DEFRAG_SDS_DICT_VAL_VOID_PTR) {
+            void *newptr, *ptr = dictGetVal(de);
+            if ((newptr = activeDefragAlloc(ptr)))
+                de->v.val = newptr, defragged++;
+        }
+        defragged += dictIterDefragEntry(di);
+    }
+    dictReleaseIterator(di);
+    return defragged;
 }
 
 /* Defrag a list of ptr, sds or robj string values */
-void activeDefragQuickListNode(quicklist *ql, quicklistNode **node_ref) {
+long activeDefragList(list *l, int val_type) {
+    long defragged = 0;
+    listNode *ln, *newln;
+    for (ln = l->head; ln; ln = ln->next) {
+        if ((newln = activeDefragAlloc(ln))) {
+            if (newln->prev)
+                newln->prev->next = newln;
+            else
+                l->head = newln;
+            if (newln->next)
+                newln->next->prev = newln;
+            else
+                l->tail = newln;
+            ln = newln;
+            defragged++;
+        }
+        if (val_type == DEFRAG_SDS_DICT_VAL_IS_SDS) {
+            sds newsds, sdsele = ln->value;
+            if ((newsds = activeDefragSds(sdsele)))
+                ln->value = newsds, defragged++;
+        } else if (val_type == DEFRAG_SDS_DICT_VAL_IS_STROB) {
+            robj *newele, *ele = ln->value;
+            if ((newele = activeDefragStringOb(ele, &defragged)))
+                ln->value = newele;
+        } else if (val_type == DEFRAG_SDS_DICT_VAL_VOID_PTR) {
+            void *newptr, *ptr = ln->value;
+            if ((newptr = activeDefragAlloc(ptr)))
+                ln->value = newptr, defragged++;
+        }
+    }
+    return defragged;
+}
+
+/* Defrag a list of sds values and a dict with the same sds keys */
+long activeDefragSdsListAndDict(list *l, dict *d, int dict_val_type) {
+    long defragged = 0;
+    sds newsds, sdsele;
+    listNode *ln, *newln;
+    dictIterator *di;
+    dictEntry *de;
+    /* Defrag the list and it's sds values */
+    for (ln = l->head; ln; ln = ln->next) {
+        if ((newln = activeDefragAlloc(ln))) {
+            if (newln->prev)
+                newln->prev->next = newln;
+            else
+                l->head = newln;
+            if (newln->next)
+                newln->next->prev = newln;
+            else
+                l->tail = newln;
+            ln = newln;
+            defragged++;
+        }
+        sdsele = ln->value;
+        if ((newsds = activeDefragSds(sdsele))) {
+            /* When defragging an sds value, we need to update the dict key */
+            uint64_t hash = dictGetHash(d, newsds);
+            replaceSatelliteDictKeyPtrAndOrDefragDictEntry(d, sdsele, newsds, hash, &defragged);
+            ln->value = newsds;
+            defragged++;
+        }
+    }
+
+    /* Defrag the dict values (keys were already handled) */
+    di = dictGetIterator(d);
+    while((de = dictNext(di)) != NULL) {
+        if (dict_val_type == DEFRAG_SDS_DICT_VAL_IS_SDS) {
+            sds newsds, sdsele = dictGetVal(de);
+            if ((newsds = activeDefragSds(sdsele)))
+                de->v.val = newsds, defragged++;
+        } else if (dict_val_type == DEFRAG_SDS_DICT_VAL_IS_STROB) {
+            robj *newele, *ele = dictGetVal(de);
+            if ((newele = activeDefragStringOb(ele, &defragged)))
+                de->v.val = newele, defragged++;
+        } else if (dict_val_type == DEFRAG_SDS_DICT_VAL_VOID_PTR) {
+            void *newptr, *ptr = dictGetVal(de);
+            if ((newptr = activeDefragAlloc(ptr)))
+                de->v.val = newptr, defragged++;
+        }
+        defragged += dictIterDefragEntry(di);
+    }
+    dictReleaseIterator(di);
+
+    return defragged;
+}
+
+/* Utility function that replaces an old key pointer in the dictionary with a
+ * new pointer. Additionally, we try to defrag the dictEntry in that dict.
+ * Oldkey mey be a dead pointer and should not be accessed (we get a
+ * pre-calculated hash value). Newkey may be null if the key pointer wasn't
+ * moved. Return value is the the dictEntry if found, or NULL if not found.
+ * NOTE: this is very ugly code, but it let's us avoid the complication of
+ * doing a scan on another dict. */
+dictEntry* replaceSatelliteDictKeyPtrAndOrDefragDictEntry(dict *d, sds oldkey, sds newkey, uint64_t hash, long *defragged) {
+    dictEntry **deref = dictFindEntryRefByPtrAndHash(d, oldkey, hash);
+    if (deref) {
+        dictEntry *de = *deref;
+        dictEntry *newde = activeDefragAlloc(de);
+        if (newde) {
+            de = *deref = newde;
+            (*defragged)++;
+        }
+        if (newkey)
+            de->key = newkey;
+        return de;
+    }
+    return NULL;
+}
+
+long activeDefragQuickListNode(quicklist *ql, quicklistNode **node_ref) {
     quicklistNode *newnode, *node = *node_ref;
+    long defragged = 0;
     unsigned char *newzl;
     if ((newnode = activeDefragAlloc(node))) {
         if (newnode->prev)
@@ -451,34 +413,33 @@ void activeDefragQuickListNode(quicklist *ql, quicklistNode **node_ref) {
         else
             ql->tail = newnode;
         *node_ref = node = newnode;
+        defragged++;
     }
-    if ((newzl = activeDefragAlloc(node->entry)))
-        node->entry = newzl;
+    if ((newzl = activeDefragAlloc(node->zl)))
+        defragged++, node->zl = newzl;
+    return defragged;
 }
 
-void activeDefragQuickListNodes(quicklist *ql) {
+long activeDefragQuickListNodes(quicklist *ql) {
     quicklistNode *node = ql->head;
+    long defragged = 0;
     while (node) {
-        activeDefragQuickListNode(ql, &node);
+        defragged += activeDefragQuickListNode(ql, &node);
         node = node->next;
     }
+    return defragged;
 }
 
 /* when the value has lots of elements, we want to handle it later and not as
  * part of the main dictionary scan. this is needed in order to prevent latency
  * spikes when handling large items */
-void defragLater(defragKeysCtx *ctx, dictEntry *kde) {
-    if (!ctx->defrag_later) {
-        ctx->defrag_later = listCreate();
-        listSetFreeMethod(ctx->defrag_later, sdsfreegeneric);
-        ctx->defrag_later_cursor = 0;
-    }
+void defragLater(redisDb *db, dictEntry *kde) {
     sds key = sdsdup(dictGetKey(kde));
-    listAddNodeTail(ctx->defrag_later, key);
+    listAddNodeTail(db->defrag_later, key);
 }
 
 /* returns 0 if no more work needs to be been done, and 1 if time is up and more work is needed. */
-long scanLaterList(robj *ob, unsigned long *cursor, monotime endtime) {
+long scanLaterList(robj *ob, unsigned long *cursor, long long endtime, long long *defragged) {
     quicklist *ql = ob->ptr;
     quicklistNode *node;
     long iterations = 0;
@@ -501,10 +462,10 @@ long scanLaterList(robj *ob, unsigned long *cursor, monotime endtime) {
 
     (*cursor)++;
     while (node) {
-        activeDefragQuickListNode(ql, &node);
+        (*defragged) += activeDefragQuickListNode(ql, &node);
         server.stat_active_defrag_scanned++;
         if (++iterations > 128 && !bookmark_failed) {
-            if (getMonotonicUs() > endtime) {
+            if (ustime() > endtime) {
                 if (!quicklistBookmarkCreate(&ql, "_AD", node)) {
                     bookmark_failed = 1;
                 } else {
@@ -523,69 +484,82 @@ long scanLaterList(robj *ob, unsigned long *cursor, monotime endtime) {
 
 typedef struct {
     zset *zs;
+    long defragged;
 } scanLaterZsetData;
 
 void scanLaterZsetCallback(void *privdata, const dictEntry *_de) {
     dictEntry *de = (dictEntry*)_de;
     scanLaterZsetData *data = privdata;
-    activeDefragZsetEntry(data->zs, de);
+    data->defragged += activeDefragZsetEntry(data->zs, de);
     server.stat_active_defrag_scanned++;
 }
 
-void scanLaterZset(robj *ob, unsigned long *cursor) {
+long scanLaterZset(robj *ob, unsigned long *cursor) {
     if (ob->type != OBJ_ZSET || ob->encoding != OBJ_ENCODING_SKIPLIST)
-        return;
+        return 0;
     zset *zs = (zset*)ob->ptr;
     dict *d = zs->dict;
-    scanLaterZsetData data = {zs};
-    dictDefragFunctions defragfns = {.defragAlloc = activeDefragAlloc};
-    *cursor = dictScanDefrag(d, *cursor, scanLaterZsetCallback, &defragfns, &data);
+    scanLaterZsetData data = {zs, 0};
+    *cursor = dictScan(d, *cursor, scanLaterZsetCallback, defragDictBucketCallback, &data);
+    return data.defragged;
 }
 
-/* Used as scan callback when all the work is done in the dictDefragFunctions. */
-void scanCallbackCountScanned(void *privdata, const dictEntry *de) {
-    UNUSED(privdata);
-    UNUSED(de);
+void scanLaterSetCallback(void *privdata, const dictEntry *_de) {
+    dictEntry *de = (dictEntry*)_de;
+    long *defragged = privdata;
+    sds sdsele = dictGetKey(de), newsds;
+    if ((newsds = activeDefragSds(sdsele)))
+        (*defragged)++, de->key = newsds;
     server.stat_active_defrag_scanned++;
 }
 
-void scanLaterSet(robj *ob, unsigned long *cursor) {
+long scanLaterSet(robj *ob, unsigned long *cursor) {
+    long defragged = 0;
     if (ob->type != OBJ_SET || ob->encoding != OBJ_ENCODING_HT)
-        return;
+        return 0;
     dict *d = ob->ptr;
-    dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = (dictDefragAllocFunction *)activeDefragSds
-    };
-    *cursor = dictScanDefrag(d, *cursor, scanCallbackCountScanned, &defragfns, NULL);
+    *cursor = dictScan(d, *cursor, scanLaterSetCallback, defragDictBucketCallback, &defragged);
+    return defragged;
 }
 
-void scanLaterHash(robj *ob, unsigned long *cursor) {
+void scanLaterHashCallback(void *privdata, const dictEntry *_de) {
+    dictEntry *de = (dictEntry*)_de;
+    long *defragged = privdata;
+    sds sdsele = dictGetKey(de), newsds;
+    if ((newsds = activeDefragSds(sdsele)))
+        (*defragged)++, de->key = newsds;
+    sdsele = dictGetVal(de);
+    if ((newsds = activeDefragSds(sdsele)))
+        (*defragged)++, de->v.val = newsds;
+    server.stat_active_defrag_scanned++;
+}
+
+long scanLaterHash(robj *ob, unsigned long *cursor) {
+    long defragged = 0;
     if (ob->type != OBJ_HASH || ob->encoding != OBJ_ENCODING_HT)
-        return;
+        return 0;
     dict *d = ob->ptr;
-    dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = NULL, /* Will be defragmented in activeDefragHfieldDictCallback. */
-        .defragVal = (dictDefragAllocFunction *)activeDefragSds
-    };
-    *cursor = dictScanDefrag(d, *cursor, activeDefragHfieldDictCallback, &defragfns, d);
+    *cursor = dictScan(d, *cursor, scanLaterHashCallback, defragDictBucketCallback, &defragged);
+    return defragged;
 }
 
-void defragQuicklist(defragKeysCtx *ctx, dictEntry *kde) {
+long defragQuicklist(redisDb *db, dictEntry *kde) {
     robj *ob = dictGetVal(kde);
+    long defragged = 0;
     quicklist *ql = ob->ptr, *newql;
     serverAssert(ob->type == OBJ_LIST && ob->encoding == OBJ_ENCODING_QUICKLIST);
     if ((newql = activeDefragAlloc(ql)))
-        ob->ptr = ql = newql;
+        defragged++, ob->ptr = ql = newql;
     if (ql->len > server.active_defrag_max_scan_fields)
-        defragLater(ctx, kde);
+        defragLater(db, kde);
     else
-        activeDefragQuickListNodes(ql);
+        defragged += activeDefragQuickListNodes(ql);
+    return defragged;
 }
 
-void defragZsetSkiplist(defragKeysCtx *ctx, dictEntry *kde) {
+long defragZsetSkiplist(redisDb *db, dictEntry *kde) {
     robj *ob = dictGetVal(kde);
+    long defragged = 0;
     zset *zs = (zset*)ob->ptr;
     zset *newzs;
     zskiplist *newzsl;
@@ -594,51 +568,62 @@ void defragZsetSkiplist(defragKeysCtx *ctx, dictEntry *kde) {
     struct zskiplistNode *newheader;
     serverAssert(ob->type == OBJ_ZSET && ob->encoding == OBJ_ENCODING_SKIPLIST);
     if ((newzs = activeDefragAlloc(zs)))
-        ob->ptr = zs = newzs;
+        defragged++, ob->ptr = zs = newzs;
     if ((newzsl = activeDefragAlloc(zs->zsl)))
-        zs->zsl = newzsl;
+        defragged++, zs->zsl = newzsl;
     if ((newheader = activeDefragAlloc(zs->zsl->header)))
-        zs->zsl->header = newheader;
+        defragged++, zs->zsl->header = newheader;
     if (dictSize(zs->dict) > server.active_defrag_max_scan_fields)
-        defragLater(ctx, kde);
+        defragLater(db, kde);
     else {
         dictIterator *di = dictGetIterator(zs->dict);
         while((de = dictNext(di)) != NULL) {
-            activeDefragZsetEntry(zs, de);
+            defragged += activeDefragZsetEntry(zs, de);
         }
         dictReleaseIterator(di);
     }
-    /* defrag the dict struct and tables */
-    if ((newdict = dictDefragTables(zs->dict)))
-        zs->dict = newdict;
+    /* handle the dict struct */
+    if ((newdict = activeDefragAlloc(zs->dict)))
+        defragged++, zs->dict = newdict;
+    /* defrag the dict tables */
+    defragged += dictDefragTables(zs->dict);
+    return defragged;
 }
 
-void defragHash(defragKeysCtx *ctx, dictEntry *kde) {
+long defragHash(redisDb *db, dictEntry *kde) {
+    long defragged = 0;
     robj *ob = dictGetVal(kde);
     dict *d, *newd;
     serverAssert(ob->type == OBJ_HASH && ob->encoding == OBJ_ENCODING_HT);
     d = ob->ptr;
     if (dictSize(d) > server.active_defrag_max_scan_fields)
-        defragLater(ctx, kde);
+        defragLater(db, kde);
     else
-        activeDefragHfieldDict(d);
-    /* defrag the dict struct and tables */
-    if ((newd = dictDefragTables(ob->ptr)))
-        ob->ptr = newd;
+        defragged += activeDefragSdsDict(d, DEFRAG_SDS_DICT_VAL_IS_SDS);
+    /* handle the dict struct */
+    if ((newd = activeDefragAlloc(ob->ptr)))
+        defragged++, ob->ptr = newd;
+    /* defrag the dict tables */
+    defragged += dictDefragTables(ob->ptr);
+    return defragged;
 }
 
-void defragSet(defragKeysCtx *ctx, dictEntry *kde) {
+long defragSet(redisDb *db, dictEntry *kde) {
+    long defragged = 0;
     robj *ob = dictGetVal(kde);
     dict *d, *newd;
     serverAssert(ob->type == OBJ_SET && ob->encoding == OBJ_ENCODING_HT);
     d = ob->ptr;
     if (dictSize(d) > server.active_defrag_max_scan_fields)
-        defragLater(ctx, kde);
+        defragLater(db, kde);
     else
-        activeDefragSdsDict(d, DEFRAG_SDS_DICT_NO_VAL);
-    /* defrag the dict struct and tables */
-    if ((newd = dictDefragTables(ob->ptr)))
-        ob->ptr = newd;
+        defragged += activeDefragSdsDict(d, DEFRAG_SDS_DICT_NO_VAL);
+    /* handle the dict struct */
+    if ((newd = activeDefragAlloc(ob->ptr)))
+        defragged++, ob->ptr = newd;
+    /* defrag the dict tables */
+    defragged += dictDefragTables(ob->ptr);
+    return defragged;
 }
 
 /* Defrag callback for radix tree iterator, called for each node,
@@ -653,7 +638,7 @@ int defragRaxNode(raxNode **noderef) {
 }
 
 /* returns 0 if no more work needs to be been done, and 1 if time is up and more work is needed. */
-int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) {
+int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, long long endtime, long long *defragged) {
     static unsigned char last[sizeof(streamID)];
     raxIterator ri;
     long iterations = 0;
@@ -687,10 +672,10 @@ int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) 
     while (raxNext(&ri)) {
         void *newdata = activeDefragAlloc(ri.data);
         if (newdata)
-            raxSetData(ri.node, ri.data=newdata);
+            raxSetData(ri.node, ri.data=newdata), (*defragged)++;
         server.stat_active_defrag_scanned++;
         if (++iterations > 128) {
-            if (getMonotonicUs() > endtime) {
+            if (ustime() > endtime) {
                 serverAssert(ri.key_len==sizeof(last));
                 memcpy(last,ri.key,ri.key_len);
                 raxStop(&ri);
@@ -705,18 +690,19 @@ int scanLaterStreamListpacks(robj *ob, unsigned long *cursor, monotime endtime) 
 }
 
 /* optional callback used defrag each rax element (not including the element pointer itself) */
-typedef void *(raxDefragFunction)(raxIterator *ri, void *privdata);
+typedef void *(raxDefragFunction)(raxIterator *ri, void *privdata, long *defragged);
 
 /* defrag radix tree including:
  * 1) rax struct
  * 2) rax nodes
  * 3) rax entry data (only if defrag_data is specified)
  * 4) call a callback per element, and allow the callback to return a new pointer for the element */
-void defragRadixTree(rax **raxref, int defrag_data, raxDefragFunction *element_cb, void *element_cb_data) {
+long defragRadixTree(rax **raxref, int defrag_data, raxDefragFunction *element_cb, void *element_cb_data) {
+    long defragged = 0;
     raxIterator ri;
     rax* rax;
     if ((rax = activeDefragAlloc(*raxref)))
-        *raxref = rax;
+        defragged++, *raxref = rax;
     rax = *raxref;
     raxStart(&ri,rax);
     ri.node_cb = defragRaxNode;
@@ -725,13 +711,14 @@ void defragRadixTree(rax **raxref, int defrag_data, raxDefragFunction *element_c
     while (raxNext(&ri)) {
         void *newdata = NULL;
         if (element_cb)
-            newdata = element_cb(&ri, element_cb_data);
+            newdata = element_cb(&ri, element_cb_data, &defragged);
         if (defrag_data && !newdata)
             newdata = activeDefragAlloc(ri.data);
         if (newdata)
-            raxSetData(ri.node, ri.data=newdata);
+            raxSetData(ri.node, ri.data=newdata), defragged++;
     }
     raxStop(&ri);
+    return defragged;
 }
 
 typedef struct {
@@ -739,7 +726,8 @@ typedef struct {
     streamConsumer *c;
 } PendingEntryContext;
 
-void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
+void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata, long *defragged) {
+    UNUSED(defragged);
     PendingEntryContext *ctx = privdata;
     streamNACK *nack = ri->data, *newnack;
     nack->consumer = ctx->c; /* update nack pointer to consumer */
@@ -749,109 +737,102 @@ void* defragStreamConsumerPendingEntry(raxIterator *ri, void *privdata) {
         void *prev;
         raxInsert(ctx->cg->pel, ri->key, ri->key_len, newnack, &prev);
         serverAssert(prev==nack);
+        /* note: we don't increment 'defragged' that's done by the caller */
     }
     return newnack;
 }
 
-void* defragStreamConsumer(raxIterator *ri, void *privdata) {
+void* defragStreamConsumer(raxIterator *ri, void *privdata, long *defragged) {
     streamConsumer *c = ri->data;
     streamCG *cg = privdata;
     void *newc = activeDefragAlloc(c);
     if (newc) {
+        /* note: we don't increment 'defragged' that's done by the caller */
         c = newc;
     }
     sds newsds = activeDefragSds(c->name);
     if (newsds)
-        c->name = newsds;
+        (*defragged)++, c->name = newsds;
     if (c->pel) {
         PendingEntryContext pel_ctx = {cg, c};
-        defragRadixTree(&c->pel, 0, defragStreamConsumerPendingEntry, &pel_ctx);
+        *defragged += defragRadixTree(&c->pel, 0, defragStreamConsumerPendingEntry, &pel_ctx);
     }
     return newc; /* returns NULL if c was not defragged */
 }
 
-void* defragStreamConsumerGroup(raxIterator *ri, void *privdata) {
+void* defragStreamConsumerGroup(raxIterator *ri, void *privdata, long *defragged) {
     streamCG *cg = ri->data;
     UNUSED(privdata);
     if (cg->consumers)
-        defragRadixTree(&cg->consumers, 0, defragStreamConsumer, cg);
+        *defragged += defragRadixTree(&cg->consumers, 0, defragStreamConsumer, cg);
     if (cg->pel)
-        defragRadixTree(&cg->pel, 0, NULL, NULL);
+        *defragged += defragRadixTree(&cg->pel, 0, NULL, NULL);
     return NULL;
 }
 
-void defragStream(defragKeysCtx *ctx, dictEntry *kde) {
+long defragStream(redisDb *db, dictEntry *kde) {
+    long defragged = 0;
     robj *ob = dictGetVal(kde);
     serverAssert(ob->type == OBJ_STREAM && ob->encoding == OBJ_ENCODING_STREAM);
     stream *s = ob->ptr, *news;
 
     /* handle the main struct */
     if ((news = activeDefragAlloc(s)))
-        ob->ptr = s = news;
+        defragged++, ob->ptr = s = news;
 
     if (raxSize(s->rax) > server.active_defrag_max_scan_fields) {
         rax *newrax = activeDefragAlloc(s->rax);
         if (newrax)
-            s->rax = newrax;
-        defragLater(ctx, kde);
+            defragged++, s->rax = newrax;
+        defragLater(db, kde);
     } else
-        defragRadixTree(&s->rax, 1, NULL, NULL);
+        defragged += defragRadixTree(&s->rax, 1, NULL, NULL);
 
     if (s->cgroups)
-        defragRadixTree(&s->cgroups, 1, defragStreamConsumerGroup, NULL);
+        defragged += defragRadixTree(&s->cgroups, 1, defragStreamConsumerGroup, NULL);
+    return defragged;
 }
 
 /* Defrag a module key. This is either done immediately or scheduled
  * for later. Returns then number of pointers defragged.
  */
-void defragModule(defragKeysCtx *ctx, redisDb *db, dictEntry *kde) {
+long defragModule(redisDb *db, dictEntry *kde) {
     robj *obj = dictGetVal(kde);
     serverAssert(obj->type == OBJ_MODULE);
-    robj keyobj;
-    initStaticStringObject(keyobj, dictGetKey(kde));
-    if (!moduleDefragValue(&keyobj, obj, db->id))
-        defragLater(ctx, kde);
+    long defragged = 0;
+
+    if (!moduleDefragValue(dictGetKey(kde), obj, &defragged))
+        defragLater(db, kde);
+
+    return defragged;
 }
 
 /* for each key we scan in the main dict, this function will attempt to defrag
- * all the various pointers it has. */
-void defragKey(defragKeysCtx *ctx, dictEntry *de) {
-    redisDb *db = &server.db[ctx->dbid];
-    int slot = ctx->kvstate.slot;
+ * all the various pointers it has. Returns a stat of how many pointers were
+ * moved. */
+long defragKey(redisDb *db, dictEntry *de) {
     sds keysds = dictGetKey(de);
-    robj *newob, *ob = dictGetVal(de);
+    robj *newob, *ob;
     unsigned char *newzl;
+    long defragged = 0;
     sds newsds;
 
     /* Try to defrag the key name. */
     newsds = activeDefragSds(keysds);
-    if (newsds) {
-        kvstoreDictSetKey(db->keys, slot, de, newsds);
-        if (kvstoreDictSize(db->expires, slot)) {
-            /* We can't search in db->expires for that key after we've released
-             * the pointer it holds, since it won't be able to do the string
-             * compare, but we can find the entry using key hash and pointer. */
-            uint64_t hash = kvstoreGetHash(db->expires, newsds);
-            dictEntry *expire_de = kvstoreDictFindByHashAndPtr(db->expires, slot, keysds, hash);
-            if (expire_de) kvstoreDictSetKey(db->expires, slot, expire_de, newsds);
-        }
-
-        /* Update the key's reference in the dict's metadata or the listpackEx. */
-        if (unlikely(ob->type == OBJ_HASH))
-            hashTypeUpdateKeyRef(ob, newsds);
+    if (newsds)
+        defragged++, de->key = newsds;
+    if (dictSize(db->expires)) {
+         /* Dirty code:
+          * I can't search in db->expires for that key after i already released
+          * the pointer it holds it won't be able to do the string compare */
+        uint64_t hash = dictGetHash(db->dict, de->key);
+        replaceSatelliteDictKeyPtrAndOrDefragDictEntry(db->expires, keysds, newsds, hash, &defragged);
     }
 
     /* Try to defrag robj and / or string value. */
-    if (unlikely(ob->type == OBJ_HASH && hashTypeGetMinExpire(ob, 0) != EB_EXPIRE_TIME_INVALID)) {
-        /* Update its reference in the ebucket while defragging it. */
-        newob = ebDefragItem(&db->hexpires, &hashExpireBucketsType, ob,
-                             (ebDefragFunction *)activeDefragStringOb);
-    } else {
-        /* If the dict doesn't have metadata, we directly defrag it. */
-        newob = activeDefragStringOb(ob);
-    }
-    if (newob) {
-        kvstoreDictSetVal(db->keys, slot, de, newob);
+    ob = dictGetVal(de);
+    if ((newob = activeDefragStringOb(ob, &defragged))) {
+        de->v.val = newob;
         ob = newob;
     }
 
@@ -859,67 +840,73 @@ void defragKey(defragKeysCtx *ctx, dictEntry *de) {
         /* Already handled in activeDefragStringOb. */
     } else if (ob->type == OBJ_LIST) {
         if (ob->encoding == OBJ_ENCODING_QUICKLIST) {
-            defragQuicklist(ctx, de);
-        } else if (ob->encoding == OBJ_ENCODING_LISTPACK) {
+            defragged += defragQuicklist(db, de);
+        } else if (ob->encoding == OBJ_ENCODING_ZIPLIST) {
             if ((newzl = activeDefragAlloc(ob->ptr)))
-                ob->ptr = newzl;
+                defragged++, ob->ptr = newzl;
         } else {
             serverPanic("Unknown list encoding");
         }
     } else if (ob->type == OBJ_SET) {
         if (ob->encoding == OBJ_ENCODING_HT) {
-            defragSet(ctx, de);
-        } else if (ob->encoding == OBJ_ENCODING_INTSET ||
-                   ob->encoding == OBJ_ENCODING_LISTPACK)
-        {
-            void *newptr, *ptr = ob->ptr;
-            if ((newptr = activeDefragAlloc(ptr)))
-                ob->ptr = newptr;
+            defragged += defragSet(db, de);
+        } else if (ob->encoding == OBJ_ENCODING_INTSET) {
+            intset *newis, *is = ob->ptr;
+            if ((newis = activeDefragAlloc(is)))
+                defragged++, ob->ptr = newis;
         } else {
             serverPanic("Unknown set encoding");
         }
     } else if (ob->type == OBJ_ZSET) {
-        if (ob->encoding == OBJ_ENCODING_LISTPACK) {
+        if (ob->encoding == OBJ_ENCODING_ZIPLIST) {
             if ((newzl = activeDefragAlloc(ob->ptr)))
-                ob->ptr = newzl;
+                defragged++, ob->ptr = newzl;
         } else if (ob->encoding == OBJ_ENCODING_SKIPLIST) {
-            defragZsetSkiplist(ctx, de);
+            defragged += defragZsetSkiplist(db, de);
         } else {
             serverPanic("Unknown sorted set encoding");
         }
     } else if (ob->type == OBJ_HASH) {
-        if (ob->encoding == OBJ_ENCODING_LISTPACK) {
+        if (ob->encoding == OBJ_ENCODING_ZIPLIST) {
             if ((newzl = activeDefragAlloc(ob->ptr)))
-                ob->ptr = newzl;
-        } else if (ob->encoding == OBJ_ENCODING_LISTPACK_EX) {
-            listpackEx *newlpt, *lpt = (listpackEx*)ob->ptr;
-            if ((newlpt = activeDefragAlloc(lpt)))
-                ob->ptr = lpt = newlpt;
-            if ((newzl = activeDefragAlloc(lpt->lp)))
-                lpt->lp = newzl;
+                defragged++, ob->ptr = newzl;
         } else if (ob->encoding == OBJ_ENCODING_HT) {
-            defragHash(ctx, de);
+            defragged += defragHash(db, de);
         } else {
             serverPanic("Unknown hash encoding");
         }
     } else if (ob->type == OBJ_STREAM) {
-        defragStream(ctx, de);
+        defragged += defragStream(db, de);
     } else if (ob->type == OBJ_MODULE) {
-        defragModule(ctx,db, de);
+        defragged += defragModule(db, de);
     } else {
         serverPanic("Unknown object type");
     }
+    return defragged;
 }
 
 /* Defrag scan callback for the main db dictionary. */
-static void dbKeysScanCallback(void *privdata, const dictEntry *de) {
-    long long hits_before = server.stat_active_defrag_hits;
-    defragKey((defragKeysCtx *)privdata, (dictEntry *)de);
-    if (server.stat_active_defrag_hits != hits_before)
+void defragScanCallback(void *privdata, const dictEntry *de) {
+    long defragged = defragKey((redisDb*)privdata, (dictEntry*)de);
+    server.stat_active_defrag_hits += defragged;
+    if(defragged)
         server.stat_active_defrag_key_hits++;
     else
         server.stat_active_defrag_key_misses++;
     server.stat_active_defrag_scanned++;
+}
+
+/* Defrag scan callback for each hash table bucket,
+ * used in order to defrag the dictEntry allocations. */
+void defragDictBucketCallback(void *privdata, dictEntry **bucketref) {
+    UNUSED(privdata); /* NOTE: this function is also used by both activeDefragCycle and scanLaterHash, etc. don't use privdata */
+    while(*bucketref) {
+        dictEntry *de = *bucketref, *newde;
+        if ((newde = activeDefragAlloc(de))) {
+            *bucketref = newde;
+        }
+        bucketref = &(*bucketref)->next;
+    }
 }
 
 /* Utility function to get the fragmentation ratio from jemalloc.
@@ -929,87 +916,51 @@ static void dbKeysScanCallback(void *privdata, const dictEntry *de) {
  * or not, a false detection can cause the defragmenter to waste a lot of CPU
  * without the possibility of getting any results. */
 float getAllocatorFragmentation(size_t *out_frag_bytes) {
-    size_t resident, active, allocated, frag_smallbins_bytes;
-    zmalloc_get_allocator_info(1, &allocated, &active, &resident, NULL, NULL, &frag_smallbins_bytes);
-
-    if (server.lua_arena != UINT_MAX) {
-        size_t lua_resident, lua_active, lua_allocated, lua_frag_smallbins_bytes;
-        zmalloc_get_allocator_info_by_arena(server.lua_arena, 0, &lua_allocated, &lua_active, &lua_resident, &lua_frag_smallbins_bytes);
-        resident -= lua_resident;
-        active -= lua_active;
-        allocated -= lua_allocated;
-        frag_smallbins_bytes -= lua_frag_smallbins_bytes;
-    }
-
-    /* Calculate the fragmentation ratio as the proportion of wasted memory in small
-     * bins (which are defraggable) relative to the total allocated memory (including large bins).
-     * This is because otherwise, if most of the memory usage is large bins, we may show high percentage,
-     * despite the fact it's not a lot of memory for the user. */
-    float frag_pct = (float)frag_smallbins_bytes / allocated * 100;
+    size_t resident, active, allocated;
+    zmalloc_get_allocator_info(&allocated, &active, &resident);
+    float frag_pct = ((float)active / allocated)*100 - 100;
+    size_t frag_bytes = active - allocated;
     float rss_pct = ((float)resident / allocated)*100 - 100;
     size_t rss_bytes = resident - allocated;
     if(out_frag_bytes)
-        *out_frag_bytes = frag_smallbins_bytes;
+        *out_frag_bytes = frag_bytes;
     serverLog(LL_DEBUG,
-        "allocated=%zu, active=%zu, resident=%zu, frag=%.2f%% (%.2f%% rss), frag_bytes=%zu (%zu rss)",
-        allocated, active, resident, frag_pct, rss_pct, frag_smallbins_bytes, rss_bytes);
+        "allocated=%zu, active=%zu, resident=%zu, frag=%.0f%% (%.0f%% rss), frag_bytes=%zu (%zu rss)",
+        allocated, active, resident, frag_pct, rss_pct, frag_bytes, rss_bytes);
     return frag_pct;
 }
 
-/* Defrag scan callback for the pubsub dictionary. */
-void defragPubsubScanCallback(void *privdata, const dictEntry *de) {
-    defragPubSubCtx *ctx = privdata;
-    kvstore *pubsub_channels = ctx->kvstate.kvs;
-    robj *newchannel, *channel = dictGetKey(de);
-    dict *newclients, *clients = dictGetVal(de);
+/* We may need to defrag other globals, one small allocation can hold a full allocator run.
+ * so although small, it is still important to defrag these */
+long defragOtherGlobals() {
+    long defragged = 0;
 
-    /* Try to defrag the channel name. */
-    serverAssert(channel->refcount == (int)dictSize(clients) + 1);
-    newchannel = activeDefragStringObEx(channel, dictSize(clients) + 1);
-    if (newchannel) {
-        kvstoreDictSetKey(pubsub_channels, ctx->kvstate.slot, (dictEntry*)de, newchannel);
-
-        /* The channel name is shared by the client's pubsub(shard) and server's
-         * pubsub(shard), after defraging the channel name, we need to update
-         * the reference in the clients' dictionary. */
-        dictIterator *di = dictGetIterator(clients);
-        dictEntry *clientde;
-        while((clientde = dictNext(di)) != NULL) {
-            client *c = dictGetKey(clientde);
-            dict *client_channels = ctx->getPubSubChannels(c);
-            dictEntry *pubsub_channel = dictFind(client_channels, newchannel);
-            serverAssert(pubsub_channel);
-            dictSetKey(ctx->getPubSubChannels(c), pubsub_channel, newchannel);
-        }
-        dictReleaseIterator(di);
-    }
-
-    /* Try to defrag the dictionary of clients that is stored as the value part. */
-    if ((newclients = dictDefragTables(clients)))
-        kvstoreDictSetVal(pubsub_channels, ctx->kvstate.slot, (dictEntry *)de, newclients);
-
-    server.stat_active_defrag_scanned++;
+    /* there are many more pointers to defrag (e.g. client argv, output / aof buffers, etc.
+     * but we assume most of these are short lived, we only need to defrag allocations
+     * that remain static for a long time */
+    defragged += activeDefragSdsDict(server.lua_scripts, DEFRAG_SDS_DICT_VAL_IS_STROB);
+    defragged += activeDefragSdsListAndDict(server.repl_scriptcache_fifo, server.repl_scriptcache_dict, DEFRAG_SDS_DICT_NO_VAL);
+    defragged += moduleDefragGlobals();
+    return defragged;
 }
 
 /* returns 0 more work may or may not be needed (see non-zero cursor),
  * and 1 if time is up and more work is needed. */
-int defragLaterItem(dictEntry *de, unsigned long *cursor, monotime endtime, int dbid) {
+int defragLaterItem(dictEntry *de, unsigned long *cursor, long long endtime) {
     if (de) {
         robj *ob = dictGetVal(de);
         if (ob->type == OBJ_LIST) {
-            return scanLaterList(ob, cursor, endtime);
+            return scanLaterList(ob, cursor, endtime, &server.stat_active_defrag_hits);
         } else if (ob->type == OBJ_SET) {
-            scanLaterSet(ob, cursor);
+            server.stat_active_defrag_hits += scanLaterSet(ob, cursor);
         } else if (ob->type == OBJ_ZSET) {
-            scanLaterZset(ob, cursor);
+            server.stat_active_defrag_hits += scanLaterZset(ob, cursor);
         } else if (ob->type == OBJ_HASH) {
-            scanLaterHash(ob, cursor);
+            server.stat_active_defrag_hits += scanLaterHash(ob, cursor);
         } else if (ob->type == OBJ_STREAM) {
-            return scanLaterStreamListpacks(ob, cursor, endtime);
+            return scanLaterStreamListpacks(ob, cursor, endtime, &server.stat_active_defrag_hits);
         } else if (ob->type == OBJ_MODULE) {
-            robj keyobj;
-            initStaticStringObject(keyobj, dictGetKey(de));
-            return moduleLateDefrag(&keyobj, ob, cursor, endtime, dbid);
+            return moduleLateDefrag(dictGetKey(de), ob, cursor, endtime, &server.stat_active_defrag_hits);
         } else {
             *cursor = 0; /* object type may have changed since we schedule it for later */
         }
@@ -1019,55 +970,78 @@ int defragLaterItem(dictEntry *de, unsigned long *cursor, monotime endtime, int 
     return 0;
 }
 
-static int defragIsRunning(void) {
-    return (defrag.timeproc_id > 0);
-}
+/* static variables serving defragLaterStep to continue scanning a key from were we stopped last time. */
+static sds defrag_later_current_key = NULL;
+static unsigned long defrag_later_cursor = 0;
 
-/* A kvstoreHelperPreContinueFn */
-static doneStatus defragLaterStep(void *ctx, monotime endtime) {
-    defragKeysCtx *defrag_keys_ctx = ctx;
-
+/* returns 0 if no more work needs to be been done, and 1 if time is up and more work is needed. */
+int defragLaterStep(redisDb *db, long long endtime) {
     unsigned int iterations = 0;
     unsigned long long prev_defragged = server.stat_active_defrag_hits;
     unsigned long long prev_scanned = server.stat_active_defrag_scanned;
+    long long key_defragged;
 
-    while (defrag_keys_ctx->defrag_later && listLength(defrag_keys_ctx->defrag_later) > 0) {
-        listNode *head = listFirst(defrag_keys_ctx->defrag_later);
-        sds key = head->value;
-        dictEntry *de = kvstoreDictFind(defrag_keys_ctx->kvstate.kvs, defrag_keys_ctx->kvstate.slot, key);
+    do {
+        /* if we're not continuing a scan from the last call or loop, start a new one */
+        if (!defrag_later_cursor) {
+            listNode *head = listFirst(db->defrag_later);
 
-        long long key_defragged = server.stat_active_defrag_hits;
-        int timeout = (defragLaterItem(de, &defrag_keys_ctx->defrag_later_cursor, endtime, defrag_keys_ctx->dbid) == 1);
-        if (key_defragged != server.stat_active_defrag_hits) {
+            /* Move on to next key */
+            if (defrag_later_current_key) {
+                serverAssert(defrag_later_current_key == head->value);
+                listDelNode(db->defrag_later, head);
+                defrag_later_cursor = 0;
+                defrag_later_current_key = NULL;
+            }
+
+            /* stop if we reached the last one. */
+            head = listFirst(db->defrag_later);
+            if (!head)
+                return 0;
+
+            /* start a new key */
+            defrag_later_current_key = head->value;
+            defrag_later_cursor = 0;
+        }
+
+        /* each time we enter this function we need to fetch the key from the dict again (if it still exists) */
+        dictEntry *de = dictFind(db->dict, defrag_later_current_key);
+        key_defragged = server.stat_active_defrag_hits;
+        do {
+            int quit = 0;
+            if (defragLaterItem(de, &defrag_later_cursor, endtime))
+                quit = 1; /* time is up, we didn't finish all the work */
+
+            /* Once in 16 scan iterations, 512 pointer reallocations, or 64 fields
+             * (if we have a lot of pointers in one hash bucket, or rehashing),
+             * check if we reached the time limit. */
+            if (quit || (++iterations > 16 ||
+                            server.stat_active_defrag_hits - prev_defragged > 512 ||
+                            server.stat_active_defrag_scanned - prev_scanned > 64)) {
+                if (quit || ustime() > endtime) {
+                    if(key_defragged != server.stat_active_defrag_hits)
+                        server.stat_active_defrag_key_hits++;
+                    else
+                        server.stat_active_defrag_key_misses++;
+                    return 1;
+                }
+                iterations = 0;
+                prev_defragged = server.stat_active_defrag_hits;
+                prev_scanned = server.stat_active_defrag_scanned;
+            }
+        } while(defrag_later_cursor);
+        if(key_defragged != server.stat_active_defrag_hits)
             server.stat_active_defrag_key_hits++;
-        } else {
+        else
             server.stat_active_defrag_key_misses++;
-        }
-
-        if (timeout) break;
-
-        if (defrag_keys_ctx->defrag_later_cursor == 0) {
-            /* the item is finished, move on */
-            listDelNode(defrag_keys_ctx->defrag_later, head);
-        }
-
-        if (++iterations > 16 || server.stat_active_defrag_hits - prev_defragged > 512 ||
-            server.stat_active_defrag_scanned - prev_scanned > 64) {
-            if (getMonotonicUs() > endtime) break;
-            iterations = 0;
-            prev_defragged = server.stat_active_defrag_hits;
-            prev_scanned = server.stat_active_defrag_scanned;
-        }
-    }
-
-    return (!defrag_keys_ctx->defrag_later || listLength(defrag_keys_ctx->defrag_later) == 0) ? DEFRAG_DONE : DEFRAG_NOT_DONE;
+    } while(1);
 }
 
 #define INTERPOLATE(x, x1, x2, y1, y2) ( (y1) + ((x)-(x1)) * ((y2)-(y1)) / ((x2)-(x1)) )
 #define LIMIT(y, min, max) ((y)<(min)? min: ((y)>(max)? max: (y)))
 
 /* decide if defrag is needed, and at what CPU effort to invest in it */
-void computeDefragCycles(void) {
+void computeDefragCycles() {
     size_t frag_bytes;
     float frag_pct = getAllocatorFragmentation(&frag_bytes);
     /* If we're not already running, and below the threshold, exit. */
@@ -1076,512 +1050,147 @@ void computeDefragCycles(void) {
             return;
     }
 
-    /* Calculate the adaptive aggressiveness of the defrag based on the current
-     * fragmentation and configurations. */
+    /* Calculate the adaptive aggressiveness of the defrag */
     int cpu_pct = INTERPOLATE(frag_pct,
             server.active_defrag_threshold_lower,
             server.active_defrag_threshold_upper,
             server.active_defrag_cycle_min,
             server.active_defrag_cycle_max);
-    cpu_pct *= defrag.decay_rate;
     cpu_pct = LIMIT(cpu_pct,
             server.active_defrag_cycle_min,
             server.active_defrag_cycle_max);
-
-    /* Normally we allow increasing the aggressiveness during a scan, but don't
-     * reduce it, since we should not lower the aggressiveness when fragmentation
-     * drops. But when a configuration is made, we should reconsider it. */
-    if (cpu_pct > server.active_defrag_running ||
-        server.active_defrag_configuration_changed)
+     /* We allow increasing the aggressiveness during a scan, but don't
+      * reduce it. */
+    if (!server.active_defrag_running ||
+        cpu_pct > server.active_defrag_running)
     {
-        server.active_defrag_configuration_changed = 0;
-        if (defragIsRunning()) {
-            serverLog(LL_VERBOSE, "Changing active defrag CPU, frag=%.0f%%, frag_bytes=%zu, cpu=%d%%",
-                      frag_pct, frag_bytes, cpu_pct);
-        } else {
-            serverLog(LL_VERBOSE,
-                "Starting active defrag, frag=%.0f%%, frag_bytes=%zu, cpu=%d%%",
-                frag_pct, frag_bytes, cpu_pct);
-        }
         server.active_defrag_running = cpu_pct;
+        serverLog(LL_VERBOSE,
+            "Starting active defrag, frag=%.0f%%, frag_bytes=%zu, cpu=%d%%",
+            frag_pct, frag_bytes, cpu_pct);
     }
 }
 
-/* This helper function handles most of the work for iterating over a kvstore. 'privdata', if
- * provided, MUST begin with 'kvstoreIterState' and this part is automatically updated by this
- * function during the iteration. */
-static doneStatus defragStageKvstoreHelper(monotime endtime,
-                                           void *ctx,
-                                           dictScanFunction scan_fn,
-                                           kvstoreHelperPreContinueFn precontinue_fn,
-                                           dictDefragFunctions *defragfns)
-{
+/* Perform incremental defragmentation work from the serverCron.
+ * This works in a similar way to activeExpireCycle, in the sense that
+ * we do incremental work across calls. */
+void activeDefragCycle(void) {
+    static int current_db = -1;
+    static unsigned long cursor = 0;
+    static redisDb *db = NULL;
+    static long long start_scan, start_stat;
     unsigned int iterations = 0;
     unsigned long long prev_defragged = server.stat_active_defrag_hits;
     unsigned long long prev_scanned = server.stat_active_defrag_scanned;
-    kvstoreIterState *state = (kvstoreIterState*)ctx;
-
-    if (state->slot == KVS_SLOT_DEFRAG_LUT) {
-        /* Before we start scanning the kvstore, handle the main structures */
-        do {
-            state->cursor = kvstoreDictLUTDefrag(state->kvs, state->cursor, dictDefragTables);
-            if (getMonotonicUs() >= endtime) return DEFRAG_NOT_DONE;
-        } while (state->cursor != 0);
-        state->slot = KVS_SLOT_UNASSIGNED;
-    }
-
-    while (1) {
-        if (++iterations > 16 || server.stat_active_defrag_hits - prev_defragged > 512 || server.stat_active_defrag_scanned - prev_scanned > 64) {
-            if (getMonotonicUs() >= endtime) break;
-            iterations = 0;
-            prev_defragged = server.stat_active_defrag_hits;
-            prev_scanned = server.stat_active_defrag_scanned;
-        }
-
-        if (precontinue_fn) {
-            if (precontinue_fn(ctx, endtime) == DEFRAG_NOT_DONE) return DEFRAG_NOT_DONE;
-        }
-
-        if (!state->cursor) {
-            /* If there's no cursor, we're ready to begin a new kvstore slot. */
-            if (state->slot == KVS_SLOT_UNASSIGNED) {
-                state->slot = kvstoreGetFirstNonEmptyDictIndex(state->kvs);
-            } else {
-                state->slot = kvstoreGetNextNonEmptyDictIndex(state->kvs, state->slot);
-            }
-
-            if (state->slot == KVS_SLOT_UNASSIGNED) return DEFRAG_DONE;
-        }
-
-        /* Whatever privdata's actual type, this function requires that it begins with kvstoreIterState. */
-        state->cursor = kvstoreDictScanDefrag(state->kvs, state->slot, state->cursor,
-                                             scan_fn, defragfns, ctx);
-    }
-
-    return DEFRAG_NOT_DONE;
-}
-
-static doneStatus defragStageDbKeys(void *ctx, monotime endtime) {
-    defragKeysCtx *defrag_keys_ctx = ctx;
-    redisDb *db = &server.db[defrag_keys_ctx->dbid];
-    if (db->keys != defrag_keys_ctx->kvstate.kvs) {
-        /* There has been a change of the kvs (flushdb, swapdb, etc.). Just complete the stage. */
-        return DEFRAG_DONE;
-    }
-
-    /* Note: for DB keys, we use the start/finish callback to fix an expires table entry if
-     * the main DB entry has been moved. */
-    static dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = NULL, /* Handled by dbKeysScanCallback */
-        .defragVal = NULL, /* Handled by dbKeysScanCallback */
-    };
-
-    return defragStageKvstoreHelper(endtime, ctx,
-        dbKeysScanCallback, defragLaterStep, &defragfns);
-}
-
-static doneStatus defragStageExpiresKvstore(void *ctx, monotime endtime) {
-    defragKeysCtx *defrag_keys_ctx = ctx;
-    redisDb *db = &server.db[defrag_keys_ctx->dbid];
-    if (db->keys != defrag_keys_ctx->kvstate.kvs) {
-        /* There has been a change of the kvs (flushdb, swapdb, etc.). Just complete the stage. */
-        return DEFRAG_DONE;
-    }
-
-    static dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = NULL, /* Not needed for expires (just a ref) */
-        .defragVal = NULL, /* Not needed for expires (no value) */
-    };
-    return defragStageKvstoreHelper(endtime, ctx,
-        scanCallbackCountScanned, NULL, &defragfns);
-}
-
-static doneStatus defragStagePubsubKvstore(void *ctx, monotime endtime) {
-    static dictDefragFunctions defragfns = {
-        .defragAlloc = activeDefragAlloc,
-        .defragKey = NULL, /* Handled by defragPubsubScanCallback */
-        .defragVal = NULL, /* Not needed for expires (no value) */
-    };
-
-    return defragStageKvstoreHelper(endtime, ctx,
-        defragPubsubScanCallback, NULL, &defragfns);
-}
-
-static doneStatus defragLuaScripts(void *ctx, monotime endtime) {
-    UNUSED(endtime);
-    UNUSED(ctx);
-    activeDefragSdsDict(evalScriptsDict(), DEFRAG_SDS_DICT_VAL_LUA_SCRIPT);
-    return DEFRAG_DONE;
-}
-
-/* Handles defragmentation of module global data. This is a stage function
- * that gets called periodically during the active defragmentation process. */
-static doneStatus defragModuleGlobals(void *ctx, monotime endtime) {
-    defragModuleCtx *defrag_module_ctx = ctx;
-
-    RedisModule *module = moduleGetHandleByName(defrag_module_ctx->module_name);
-    if (!module) {
-        /* Module has been unloaded, nothing to defrag. */
-        return DEFRAG_DONE;
-    }
-    /* Interval shouldn't exceed 1 hour  */
-    serverAssert(!endtime || llabs((long long)endtime - (long long)getMonotonicUs()) < 60*60*1000*1000LL);
-
-    /* Set up context for the module's defrag callback. */
-    defrag_module_ctx->module_ctx->endtime = endtime;
-    defrag_module_ctx->module_ctx->cursor = &defrag_module_ctx->cursor;
-
-    /* Call appropriate version of module's defrag callback:
-     * 1. Version 2 (defrag_cb_2): Supports incremental defrag and returns whether more work is needed
-     * 2. Version 1 (defrag_cb): Legacy version, performs all work in one call.
-     *    Note: V1 doesn't support incremental defragmentation, may block for longer periods. */
-    if (module->defrag_cb_2) {
-        return module->defrag_cb_2(defrag_module_ctx->module_ctx) ? DEFRAG_NOT_DONE : DEFRAG_DONE;
-    } else if (module->defrag_cb) {
-        module->defrag_cb(defrag_module_ctx->module_ctx);
-        return DEFRAG_DONE;
-    } else {
-        redis_unreachable();
-    }
-}
-
-static void freeDefragKeysContext(void *ctx) {
-    defragKeysCtx *defrag_keys_ctx = ctx;
-    if (defrag_keys_ctx->defrag_later) {
-        listRelease(defrag_keys_ctx->defrag_later);
-    }
-    zfree(defrag_keys_ctx);
-}
-
-static void freeDefragModelContext(void *ctx) {
-    defragModuleCtx *defrag_model_ctx = ctx;
-    sdsfree(defrag_model_ctx->module_name);
-    zfree(defrag_model_ctx->module_ctx);
-    zfree(defrag_model_ctx);
-}
-
-static void freeDefragContext(void *ptr) {
-    StageDescriptor *stage = ptr;
-    if (stage->ctx_free_fn)
-        stage->ctx_free_fn(stage->ctx);
-    zfree(stage);
-}
-
-static void addDefragStage(defragStageFn stage_fn, defragStageContextFreeFn ctx_free_fn, void *ctx) {
-    StageDescriptor *stage = zmalloc(sizeof(StageDescriptor));
-    stage->stage_fn = stage_fn;
-    stage->ctx_free_fn = ctx_free_fn;
-    stage->ctx = ctx;
-    listAddNodeTail(defrag.remaining_stages, stage);
-}
-
-/* Updates the defrag decay rate based on the observed effectiveness of the defrag process.
- * The decay rate is used to gradually slow down defrag when it's not being effective. */
-static void updateDefragDecayRate(float frag_pct) {
-    long long last_hits = server.stat_active_defrag_hits - defrag.start_defrag_hits;
-    long long last_misses = server.stat_active_defrag_misses - defrag.start_defrag_misses;
-    float last_frag_pct_change = defrag.start_frag_pct - frag_pct;
-    /* When defragmentation efficiency is low, we gradually reduce the
-     * speed for the next cycle to avoid CPU waste. However, in the
-     * following two cases, we keep the normal speed:
-     * 1) If the fragmentation percentage has increased or decreased by more than 2%.
-     * 2) If the fragmentation percentage decrease is small, but hits are above 1%,
-     *    we still keep the normal speed. */
-    if (fabs(last_frag_pct_change) > 2 ||
-        (last_frag_pct_change < 0 && last_hits >= (last_hits + last_misses) * 0.01))
-    {
-        defrag.decay_rate = 1.0f;
-    } else {
-        defrag.decay_rate *= 0.9;
-    }
-}
-
-/* Called at the end of a complete defrag cycle, or when defrag is terminated */
-static void endDefragCycle(int normal_termination) {
-    if (normal_termination) {
-        /* For normal termination, we expect... */
-        serverAssert(!defrag.current_stage);
-        serverAssert(listLength(defrag.remaining_stages) == 0);
-    } else {
-        /* Defrag is being terminated abnormally */
-        aeDeleteTimeEvent(server.el, defrag.timeproc_id);
-
-        if (defrag.current_stage) {
-            listDelNode(defrag.remaining_stages, defrag.current_stage);
-            defrag.current_stage = NULL;
-        }
-    }
-    defrag.timeproc_id = AE_DELETED_EVENT_ID;
-
-    listRelease(defrag.remaining_stages);
-    defrag.remaining_stages = NULL;
-
-    size_t frag_bytes;
-    float frag_pct = getAllocatorFragmentation(&frag_bytes);
-    serverLog(LL_VERBOSE, "Active defrag done in %dms, reallocated=%d, frag=%.0f%%, frag_bytes=%zu",
-              (int)elapsedMs(defrag.start_cycle), (int)(server.stat_active_defrag_hits - defrag.start_defrag_hits),
-              frag_pct, frag_bytes);
-
-    server.stat_total_active_defrag_time += elapsedUs(server.stat_last_active_defrag_time);
-    server.stat_last_active_defrag_time = 0;
-    server.active_defrag_running = 0;
-
-    updateDefragDecayRate(frag_pct);
-    moduleDefragEnd();
-
-    /* Immediately check to see if we should start another defrag cycle. */
-    activeDefragCycle();
-}
-
-/* Must be called at the start of the timeProc as it measures the delay from the end of the previous
- * timeProc invocation when performing the computation. */
-static int computeDefragCycleUs(void) {
-    long dutyCycleUs;
-
-    int targetCpuPercent = server.active_defrag_running;
-    serverAssert(targetCpuPercent > 0 && targetCpuPercent < 100);
-
-    static int prevCpuPercent = 0; /* STATIC - this persists */
-    if (targetCpuPercent != prevCpuPercent) {
-        /* If the targetCpuPercent changes, the value might be different from when the last wait
-         * time was computed. In this case, don't consider wait time. (This is really only an
-         * issue in crazy tests that dramatically increase CPU while defrag is running.) */
-        defrag.timeproc_end_time = 0;
-        prevCpuPercent = targetCpuPercent;
-    }
-
-    /* Given when the last duty cycle ended, compute time needed to achieve the desired percentage. */
-    if (defrag.timeproc_end_time == 0) {
-        /* Either the first call to the timeProc, or we were paused for some reason. */
-        defrag.timeproc_overage_us = 0;
-        dutyCycleUs = DEFRAG_CYCLE_US;
-    } else {
-        long waitedUs = getMonotonicUs() - defrag.timeproc_end_time;
-        /* Given the elapsed wait time between calls, compute the necessary duty time needed to
-         * achieve the desired CPU percentage.
-         * With:  D = duty time, W = wait time, P = percent
-         * Solve:    D          P
-         *         -----   =  -----
-         *         D + W       100
-         * Solving for D:
-         *     D = P * W / (100 - P)
-         *
-         * Note that dutyCycleUs addresses starvation. If the wait time was long, we will compensate
-         * with a proportionately long duty-cycle. This won't significantly affect perceived
-         * latency, because clients are already being impacted by the long cycle time which caused
-         * the starvation of the timer. */
-        dutyCycleUs = targetCpuPercent * waitedUs / (100 - targetCpuPercent);
-
-        /* Also adjust for any accumulated overage. */
-        dutyCycleUs -= defrag.timeproc_overage_us;
-        defrag.timeproc_overage_us = 0;
-
-        if (dutyCycleUs < DEFRAG_CYCLE_US) {
-            /* We never reduce our cycle time, that would increase overhead. Instead, we track this
-             * as part of the overage, and increase wait time between cycles. */
-            defrag.timeproc_overage_us = DEFRAG_CYCLE_US - dutyCycleUs;
-            dutyCycleUs = DEFRAG_CYCLE_US;
-        } else if (dutyCycleUs > DEFRAG_CYCLE_US * 10) {
-            /* Add a time limit for the defrag duty cycle to prevent excessive latency.
-             * When latency is already high (indicated by a long time between calls),
-             * we don't want to make it worse by running defrag for too long. */
-            dutyCycleUs = DEFRAG_CYCLE_US * 10;
-        }
-    }
-    return dutyCycleUs;
-}
-
-/* Must be called at the end of the timeProc as it records the timeproc_end_time for use in the next
- * computeDefragCycleUs computation. */
-static int computeDelayMs(monotime intendedEndtime) {
-    defrag.timeproc_end_time = getMonotonicUs();
-    long overage = defrag.timeproc_end_time - intendedEndtime;
-    defrag.timeproc_overage_us += overage; /* track over/under desired CPU */
-    /* Allow negative overage (underage) to count against existing overage, but don't allow
-     * underage (from short stages) to be accumulated. */
-    if (defrag.timeproc_overage_us < 0) defrag.timeproc_overage_us = 0;
-
-    int targetCpuPercent = server.active_defrag_running;
-    serverAssert(targetCpuPercent > 0 && targetCpuPercent < 100);
-
-    /* Given the desired duty cycle, what inter-cycle delay do we need to achieve that? */
-    /* We want to achieve a specific CPU percent. To do that, we can't use a skewed computation. */
-    /* Example, if we run for 1ms and delay 10ms, that's NOT 10%, because the total cycle time is 11ms. */
-    /* Instead, if we rum for 1ms, our total time should be 10ms. So the delay is only 9ms. */
-    long totalCycleTimeUs = DEFRAG_CYCLE_US * 100 / targetCpuPercent;
-    long delayUs = totalCycleTimeUs - DEFRAG_CYCLE_US;
-    /* Only increase delay by the fraction of the overage that would be non-duty-cycle */
-    delayUs += defrag.timeproc_overage_us * (100 - targetCpuPercent) / 100;
-    if (delayUs < 0) delayUs = 0;
-    long delayMs = delayUs / 1000; /* round down */
-    return delayMs;
-}
-
-/* An independent time proc for defrag. While defrag is running, this is called much more often
- * than the server cron. Frequent short calls provides low latency impact. */
-static int activeDefragTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    UNUSED(eventLoop);
-    UNUSED(id);
-    UNUSED(clientData);
-
-    /* This timer shouldn't be registered unless there's work to do. */
-    serverAssert(defrag.current_stage || listLength(defrag.remaining_stages) > 0);
+    long long start, timelimit, endtime;
+    mstime_t latency;
+    int quit = 0;
 
     if (!server.active_defrag_enabled) {
-        /* Defrag has been disabled while running */
-        endDefragCycle(0);
-        return AE_NOMORE;
+        if (server.active_defrag_running) {
+            /* if active defrag was disabled mid-run, start from fresh next time. */
+            server.active_defrag_running = 0;
+            if (db)
+                listEmpty(db->defrag_later);
+            defrag_later_current_key = NULL;
+            defrag_later_cursor = 0;
+            current_db = -1;
+            cursor = 0;
+            db = NULL;
+        }
+        return;
     }
 
-    if (hasActiveChildProcess()) {
-        /* If there's a child process, pause the defrag, polling until the child completes. */
-        defrag.timeproc_end_time = 0; /* prevent starvation recovery */
-        return 100;
+    if (hasActiveChildProcess())
+        return; /* Defragging memory while there's a fork will just do damage. */
+
+    /* Once a second, check if the fragmentation justfies starting a scan
+     * or making it more aggressive. */
+    run_with_period(1000) {
+        computeDefragCycles();
     }
+    if (!server.active_defrag_running)
+        return;
 
-    monotime starttime = getMonotonicUs();
-    int dutyCycleUs = computeDefragCycleUs();
-    monotime endtime = starttime + dutyCycleUs;
-    int haveMoreWork = 1;
-
-    /* Increment server.cronloops so that run_with_period works. */
-    long hz_ms = 1000 / server.hz;
-    int cronloops = (server.mstime - server.blocked_last_cron + (hz_ms - 1)) / hz_ms; /* rounding up */
-    server.blocked_last_cron += cronloops * hz_ms;
-    server.cronloops += cronloops;
-
-    mstime_t latency;
+    /* See activeExpireCycle for how timelimit is handled. */
+    start = ustime();
+    timelimit = 1000000*server.active_defrag_running/server.hz/100;
+    if (timelimit <= 0) timelimit = 1;
+    endtime = start + timelimit;
     latencyStartMonitor(latency);
 
     do {
-        if (!defrag.current_stage) {
-            defrag.current_stage = listFirst(defrag.remaining_stages);
+        /* if we're not continuing a scan from the last call or loop, start a new one */
+        if (!cursor) {
+            /* finish any leftovers from previous db before moving to the next one */
+            if (db && defragLaterStep(db, endtime)) {
+                quit = 1; /* time is up, we didn't finish all the work */
+                break; /* this will exit the function and we'll continue on the next cycle */
+            }
+
+            /* Move on to next database, and stop if we reached the last one. */
+            if (++current_db >= server.dbnum) {
+                /* defrag other items not part of the db / keys */
+                defragOtherGlobals();
+
+                long long now = ustime();
+                size_t frag_bytes;
+                float frag_pct = getAllocatorFragmentation(&frag_bytes);
+                serverLog(LL_VERBOSE,
+                    "Active defrag done in %dms, reallocated=%d, frag=%.0f%%, frag_bytes=%zu",
+                    (int)((now - start_scan)/1000), (int)(server.stat_active_defrag_hits - start_stat), frag_pct, frag_bytes);
+
+                start_scan = now;
+                current_db = -1;
+                cursor = 0;
+                db = NULL;
+                server.active_defrag_running = 0;
+
+                computeDefragCycles(); /* if another scan is needed, start it right away */
+                if (server.active_defrag_running != 0 && ustime() < endtime)
+                    continue;
+                break;
+            }
+            else if (current_db==0) {
+                /* Start a scan from the first database. */
+                start_scan = ustime();
+                start_stat = server.stat_active_defrag_hits;
+            }
+
+            db = &server.db[current_db];
+            cursor = 0;
         }
 
-        StageDescriptor *stage = listNodeValue(defrag.current_stage);
-        doneStatus status = stage->stage_fn(stage->ctx, endtime);
-        if (status == DEFRAG_DONE) {
-            listDelNode(defrag.remaining_stages, defrag.current_stage);
-            defrag.current_stage = NULL;
-        }
+        do {
+            /* before scanning the next bucket, see if we have big keys left from the previous bucket to scan */
+            if (defragLaterStep(db, endtime)) {
+                quit = 1; /* time is up, we didn't finish all the work */
+                break; /* this will exit the function and we'll continue on the next cycle */
+            }
 
-        haveMoreWork = (defrag.current_stage || listLength(defrag.remaining_stages) > 0);
-        /* If we've completed a stage early, and still have a standard time allotment remaining,
-         * we'll start another stage. This can happen when defrag is running infrequently, and
-         * starvation protection has increased the duty-cycle. */
-    } while (haveMoreWork && getMonotonicUs() <= endtime - DEFRAG_CYCLE_US);
+            cursor = dictScan(db->dict, cursor, defragScanCallback, defragDictBucketCallback, db);
+
+            /* Once in 16 scan iterations, 512 pointer reallocations. or 64 keys
+             * (if we have a lot of pointers in one hash bucket or rehasing),
+             * check if we reached the time limit.
+             * But regardless, don't start a new db in this loop, this is because after
+             * the last db we call defragOtherGlobals, which must be done in one cycle */
+            if (!cursor || (++iterations > 16 ||
+                            server.stat_active_defrag_hits - prev_defragged > 512 ||
+                            server.stat_active_defrag_scanned - prev_scanned > 64)) {
+                if (!cursor || ustime() > endtime) {
+                    quit = 1;
+                    break;
+                }
+                iterations = 0;
+                prev_defragged = server.stat_active_defrag_hits;
+                prev_scanned = server.stat_active_defrag_scanned;
+            }
+        } while(cursor && !quit);
+    } while(!quit);
 
     latencyEndMonitor(latency);
-    latencyAddSampleIfNeeded("active-defrag-cycle", latency);
-
-    if (haveMoreWork) {
-        return computeDelayMs(endtime);
-    } else {
-        endDefragCycle(1);
-        return AE_NOMORE; /* Ends the timer proc */
-    }
-}
-
-/* During long running scripts, or while loading, there is a periodic function for handling other
- * actions. This interface allows defrag to continue running, avoiding a single long defrag step
- * after the long operation completes. */
-void defragWhileBlocked(void) {
-    /* This is called infrequently, while timers are not active. We might need to start defrag. */
-    if (!defragIsRunning()) activeDefragCycle();
-
-    if (!defragIsRunning()) return;
-
-    /* Save off the timeproc_id. If we have a normal termination, it will be cleared. */
-    long long timeproc_id = defrag.timeproc_id;
-
-    /* Simulate a single call of the timer proc */
-    long long reschedule_delay = activeDefragTimeProc(NULL, 0, NULL);
-    if (reschedule_delay == AE_NOMORE) {
-        /* If it's done, deregister the timer */
-        aeDeleteTimeEvent(server.el, timeproc_id);
-    }
-    /* Otherwise, just ignore the reschedule_delay, the timer will pop the next time that the
-     * event loop can process timers again. */
-}
-
-static void beginDefragCycle(void) {
-    serverAssert(!defragIsRunning());
-
-    moduleDefragStart();
-
-    serverAssert(defrag.remaining_stages == NULL);
-    defrag.remaining_stages = listCreate();
-    listSetFreeMethod(defrag.remaining_stages, freeDefragContext);
-
-    for (int dbid = 0; dbid < server.dbnum; dbid++) {
-        redisDb *db = &server.db[dbid];
-
-        /* Add stage for keys. */
-        defragKeysCtx *defrag_keys_ctx = zcalloc(sizeof(defragKeysCtx));
-        defrag_keys_ctx->kvstate = INIT_KVSTORE_STATE(db->keys);
-        defrag_keys_ctx->dbid = dbid;
-        addDefragStage(defragStageDbKeys, freeDefragKeysContext, defrag_keys_ctx);
-
-        /* Add stage for expires. */
-        defragKeysCtx *defrag_expires_ctx = zcalloc(sizeof(defragKeysCtx));
-        defrag_expires_ctx->kvstate = INIT_KVSTORE_STATE(db->expires);
-        defrag_expires_ctx->dbid = dbid;
-        addDefragStage(defragStageExpiresKvstore, freeDefragKeysContext, defrag_expires_ctx);
-    }
-
-    /* Add stage for pubsub channels. */
-    defragPubSubCtx *defrag_pubsub_ctx = zmalloc(sizeof(defragPubSubCtx));
-    defrag_pubsub_ctx->kvstate = INIT_KVSTORE_STATE(server.pubsub_channels);
-    defrag_pubsub_ctx->getPubSubChannels = getClientPubSubChannels;
-    addDefragStage(defragStagePubsubKvstore, zfree, defrag_pubsub_ctx);
-
-    /* Add stage for pubsubshard channels. */
-    defragPubSubCtx *defrag_pubsubshard_ctx = zmalloc(sizeof(defragPubSubCtx));
-    defrag_pubsubshard_ctx->kvstate = INIT_KVSTORE_STATE(server.pubsubshard_channels);
-    defrag_pubsubshard_ctx->getPubSubChannels = getClientPubSubShardChannels;
-    addDefragStage(defragStagePubsubKvstore, zfree, defrag_pubsubshard_ctx);
-
-    addDefragStage(defragLuaScripts, NULL, NULL);
-
-    /* Add stages for modules. */
-    dictIterator *di = dictGetIterator(modules);
-    dictEntry *de;
-    while ((de = dictNext(di)) != NULL) {
-        struct RedisModule *module = dictGetVal(de);
-        if (module->defrag_cb || module->defrag_cb_2) {
-            defragModuleCtx *ctx = zmalloc(sizeof(defragModuleCtx));
-            ctx->cursor = 0;
-            ctx->module_name = sdsnew(module->name);
-            ctx->module_ctx = zcalloc(sizeof(RedisModuleDefragCtx));
-            addDefragStage(defragModuleGlobals, freeDefragModelContext, ctx);
-        }
-    }
-    dictReleaseIterator(di);
-
-    defrag.current_stage = NULL;
-    defrag.start_cycle = getMonotonicUs();
-    defrag.start_defrag_hits = server.stat_active_defrag_hits;
-    defrag.start_defrag_misses = server.stat_active_defrag_misses;
-    defrag.start_frag_pct = getAllocatorFragmentation(NULL);
-    defrag.timeproc_end_time = 0;
-    defrag.timeproc_overage_us = 0;
-    defrag.timeproc_id = aeCreateTimeEvent(server.el, 0, activeDefragTimeProc, NULL, NULL);
-
-    elapsedStart(&server.stat_last_active_defrag_time);
-}
-
-void activeDefragCycle(void) {
-    if (!server.active_defrag_enabled) return;
-
-    /* Defrag gets paused while a child process is active. So there's no point in starting a new
-     * cycle or adjusting the CPU percentage for an existing cycle. */
-    if (hasActiveChildProcess()) return;
-
-    computeDefragCycles();
-
-    if (server.active_defrag_running > 0 && !defragIsRunning()) beginDefragCycle();
+    latencyAddSampleIfNeeded("active-defrag-cycle",latency);
 }
 
 #else /* HAVE_DEFRAG */
@@ -1595,22 +1204,10 @@ void *activeDefragAlloc(void *ptr) {
     return NULL;
 }
 
-void *activeDefragAllocRaw(size_t size) {
-    /* fallback to regular allocation */
-    return zmalloc(size);
-}
-
-void activeDefragFreeRaw(void *ptr) {
-    /* fallback to regular free */
-    zfree(ptr);
-}
-
-robj *activeDefragStringOb(robj *ob) {
+robj *activeDefragStringOb(robj *ob, long *defragged) {
     UNUSED(ob);
+    UNUSED(defragged);
     return NULL;
-}
-
-void defragWhileBlocked(void) {
 }
 
 #endif

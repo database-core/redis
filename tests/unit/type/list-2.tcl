@@ -4,7 +4,7 @@ start_server {
         "list-max-ziplist-size" 4
     }
 } {
-    array set largevalue [generate_largevalue_test_array]
+    source "tests/unit/type/list-common.tcl"
 
     foreach {type large} [array get largevalue] {
         tags {"slow"} {

@@ -132,7 +132,7 @@ int stream_range(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     assert(errno == ENOENT);
 
     /* Return array. */
-    RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_LEN);
+    RedisModule_ReplyWithArray(ctx, REDISMODULE_POSTPONED_ARRAY_LEN);
     RedisModule_AutoMemory(ctx);
     RedisModuleStreamID id;
     long numfields;
@@ -238,19 +238,19 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_Init(ctx, "stream", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
-    if (RedisModule_CreateCommand(ctx, "stream.add", stream_add, "write",
+    if (RedisModule_CreateCommand(ctx, "stream.add", stream_add, "",
                                   1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-    if (RedisModule_CreateCommand(ctx, "stream.addn", stream_addn, "write",
+    if (RedisModule_CreateCommand(ctx, "stream.addn", stream_addn, "",
                                   1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-    if (RedisModule_CreateCommand(ctx, "stream.delete", stream_delete, "write",
+    if (RedisModule_CreateCommand(ctx, "stream.delete", stream_delete, "",
                                   1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-    if (RedisModule_CreateCommand(ctx, "stream.range", stream_range, "write",
+    if (RedisModule_CreateCommand(ctx, "stream.range", stream_range, "",
                                   1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-    if (RedisModule_CreateCommand(ctx, "stream.trim", stream_trim, "write",
+    if (RedisModule_CreateCommand(ctx, "stream.trim", stream_trim, "",
                                   1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 

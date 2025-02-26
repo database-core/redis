@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013-2014, yinqiwen <yinqiwen@gmail.com>
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>.
- * Copyright (c) 2015-current, Redis Ltd.
+ * Copyright (c) 2015-2016, Salvatore Sanfilippo <antirez@gmail.com>.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -91,8 +91,8 @@ uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
  *    \-----------------/          --------               \-----------------/
  *     \               /         /          \              \               /
  *      \  (long,lat) /         / (long,lat) \              \  (long,lat) /
- *       \           /         /              \             /             \
- *         ---------          /----------------\           /---------------\
+ *       \           /         /              \              /            \
+ *         ---------          /----------------\            /--------------\
  *  Northern Hemisphere       Southern Hemisphere         Around the equator
  */
 int geohashBoundingBox(GeoShape *shape, double *bounds) {
@@ -164,14 +164,14 @@ GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape) {
         geohashDecode(long_range, lat_range, neighbors.east, &east);
         geohashDecode(long_range, lat_range, neighbors.west, &west);
 
-        if (north.latitude.max < max_lat) 
-            decrease_step = 1;
-        if (south.latitude.min > min_lat) 
-            decrease_step = 1;
-        if (east.longitude.max < max_lon) 
-            decrease_step = 1;
-        if (west.longitude.min > min_lon)  
-            decrease_step = 1;
+        if (geohashGetDistance(longitude,latitude,longitude,north.latitude.max)
+            < radius_meters) decrease_step = 1;
+        if (geohashGetDistance(longitude,latitude,longitude,south.latitude.min)
+            < radius_meters) decrease_step = 1;
+        if (geohashGetDistance(longitude,latitude,east.longitude.max,latitude)
+            < radius_meters) decrease_step = 1;
+        if (geohashGetDistance(longitude,latitude,west.longitude.min,latitude)
+            < radius_meters) decrease_step = 1;
     }
 
     if (steps > 1 && decrease_step) {
@@ -216,29 +216,17 @@ GeoHashFix52Bits geohashAlign52Bits(const GeoHashBits hash) {
     return bits;
 }
 
-/* Calculate distance using simplified haversine great circle distance formula.
- * Given longitude diff is 0 the asin(sqrt(a)) on the haversine is asin(sin(abs(u))).
- * arcsin(sin(x)) equal to x when x ∈[−𝜋/2,𝜋/2]. Given latitude is between [−𝜋/2,𝜋/2]
- * we can simplify arcsin(sin(x)) to x.
- */
-double geohashGetLatDistance(double lat1d, double lat2d) {
-    return EARTH_RADIUS_IN_METERS * fabs(deg_rad(lat2d) - deg_rad(lat1d));
-}
-
-/* Calculate distance using haversine great circle distance formula. */
+/* Calculate distance using haversin great circle distance formula. */
 double geohashGetDistance(double lon1d, double lat1d, double lon2d, double lat2d) {
-    double lat1r, lon1r, lat2r, lon2r, u, v, a;
-    lon1r = deg_rad(lon1d);
-    lon2r = deg_rad(lon2d);
-    v = sin((lon2r - lon1r) / 2);
-    /* if v == 0 we can avoid doing expensive math when lons are practically the same */
-    if (v == 0.0)
-        return geohashGetLatDistance(lat1d, lat2d);
+    double lat1r, lon1r, lat2r, lon2r, u, v;
     lat1r = deg_rad(lat1d);
+    lon1r = deg_rad(lon1d);
     lat2r = deg_rad(lat2d);
+    lon2r = deg_rad(lon2d);
     u = sin((lat2r - lat1r) / 2);
-    a = u * u + cos(lat1r) * cos(lat2r) * v * v;
-    return 2.0 * EARTH_RADIUS_IN_METERS * asin(sqrt(a));
+    v = sin((lon2r - lon1r) / 2);
+    return 2.0 * EARTH_RADIUS_IN_METERS *
+           asin(sqrt(u * u + cos(lat1r) * cos(lat2r) * v * v));
 }
 
 int geohashGetDistanceIfInRadius(double x1, double y1,
@@ -265,14 +253,9 @@ int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
  */
 int geohashGetDistanceIfInRectangle(double width_m, double height_m, double x1, double y1,
                                     double x2, double y2, double *distance) {
-    /* latitude distance is less expensive to compute than longitude distance
-     * so we check first for the latitude condition */
-    double lat_distance = geohashGetLatDistance(y2, y1);
-    if (lat_distance > height_m/2) {
-        return 0;
-    }
     double lon_distance = geohashGetDistance(x2, y2, x1, y2);
-    if (lon_distance > width_m/2) {
+    double lat_distance = geohashGetDistance(x2, y2, x2, y1);
+    if (lon_distance > width_m/2 || lat_distance > height_m/2) {
         return 0;
     }
     *distance = geohashGetDistance(x1, y1, x2, y2);

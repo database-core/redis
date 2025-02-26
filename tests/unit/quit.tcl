@@ -1,4 +1,11 @@
 start_server {tags {"quit"}} {
+    proc format_command {args} {
+        set cmd "*[llength $args]\r\n"
+        foreach a $args {
+            append cmd "$[string length $a]\r\n$a\r\n"
+        }
+        set _ $cmd
+    }
 
     test "QUIT returns OK" {
         reconnect

@@ -1,78 +1,35 @@
 /*
- * Copyright (c) 2009-Present, Redis Ltd.
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "server.h"
-#include "cluster.h"
 
-/* Structure to hold the pubsub related metadata. Currently used
- * for pubsub and pubsubshard feature. */
-typedef struct pubsubtype {
-    int shard;
-    dict *(*clientPubSubChannels)(client*);
-    int (*subscriptionCount)(client*);
-    kvstore **serverPubSubChannels;
-    robj **subscribeMsg;
-    robj **unsubscribeMsg;
-    robj **messageBulk;
-}pubsubtype;
-
-/*
- * Get client's global Pub/Sub channels subscription count.
- */
 int clientSubscriptionsCount(client *c);
-
-/*
- * Get client's shard level Pub/Sub channels subscription count.
- */
-int clientShardSubscriptionsCount(client *c);
-
-/*
- * Get client's global Pub/Sub channels dict.
- */
-dict* getClientPubSubChannels(client *c);
-
-/*
- * Get client's shard level Pub/Sub channels dict.
- */
-dict* getClientPubSubShardChannels(client *c);
-
-/*
- * Get list of channels client is subscribed to.
- * If a pattern is provided, the subset of channels is returned
- * matching the pattern.
- */
-void channelList(client *c, sds pat, kvstore *pubsub_channels);
-
-/*
- * Pub/Sub type for global channels.
- */
-pubsubtype pubSubType = {
-    .shard = 0,
-    .clientPubSubChannels = getClientPubSubChannels,
-    .subscriptionCount = clientSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsub_channels,
-    .subscribeMsg = &shared.subscribebulk,
-    .unsubscribeMsg = &shared.unsubscribebulk,
-    .messageBulk = &shared.messagebulk,
-};
-
-/*
- * Pub/Sub type for shard level channels bounded to a slot.
- */
-pubsubtype pubSubShardType = {
-    .shard = 1,
-    .clientPubSubChannels = getClientPubSubShardChannels,
-    .subscriptionCount = clientShardSubscriptionsCount,
-    .serverPubSubChannels = &server.pubsubshard_channels,
-    .subscribeMsg = &shared.ssubscribebulk,
-    .unsubscribeMsg = &shared.sunsubscribebulk,
-    .messageBulk = &shared.smessagebulk,
-};
 
 /*-----------------------------------------------------------------------------
  * Pubsub client replies API
@@ -83,25 +40,20 @@ pubsubtype pubSubShardType = {
  * message. However if the caller sets 'msg' as NULL, it will be able
  * to send a special message (for instance an Array type) by using the
  * addReply*() API family. */
-void addReplyPubsubMessage(client *c, robj *channel, robj *msg, robj *message_bulk) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
+void addReplyPubsubMessage(client *c, robj *channel, robj *msg) {
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[3]);
     else
         addReplyPushLen(c,3);
-    addReply(c,message_bulk);
+    addReply(c,shared.messagebulk);
     addReplyBulk(c,channel);
     if (msg) addReplyBulk(c,msg);
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
 /* Send a pubsub message of type "pmessage" to the client. The difference
  * with the "message" type delivered by addReplyPubsubMessage() is that
  * this message format also includes the pattern that matched the message. */
 void addReplyPubsubPatMessage(client *c, robj *pat, robj *channel, robj *msg) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[4]);
     else
@@ -110,47 +62,38 @@ void addReplyPubsubPatMessage(client *c, robj *pat, robj *channel, robj *msg) {
     addReplyBulk(c,pat);
     addReplyBulk(c,channel);
     addReplyBulk(c,msg);
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
 /* Send the pubsub subscription notification to the client. */
-void addReplyPubsubSubscribed(client *c, robj *channel, pubsubtype type) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
+void addReplyPubsubSubscribed(client *c, robj *channel) {
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[3]);
     else
         addReplyPushLen(c,3);
-    addReply(c,*type.subscribeMsg);
+    addReply(c,shared.subscribebulk);
     addReplyBulk(c,channel);
-    addReplyLongLong(c,type.subscriptionCount(c));
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
+    addReplyLongLong(c,clientSubscriptionsCount(c));
 }
 
 /* Send the pubsub unsubscription notification to the client.
  * Channel can be NULL: this is useful when the client sends a mass
  * unsubscribe command but there are no channels to unsubscribe from: we
  * still send a notification. */
-void addReplyPubsubUnsubscribed(client *c, robj *channel, pubsubtype type) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
+void addReplyPubsubUnsubscribed(client *c, robj *channel) {
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[3]);
     else
         addReplyPushLen(c,3);
-    addReply(c, *type.unsubscribeMsg);
+    addReply(c,shared.unsubscribebulk);
     if (channel)
         addReplyBulk(c,channel);
     else
         addReplyNull(c);
-    addReplyLongLong(c,type.subscriptionCount(c));
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
+    addReplyLongLong(c,clientSubscriptionsCount(c));
 }
 
 /* Send the pubsub pattern subscription notification to the client. */
 void addReplyPubsubPatSubscribed(client *c, robj *pattern) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[3]);
     else
@@ -158,7 +101,6 @@ void addReplyPubsubPatSubscribed(client *c, robj *pattern) {
     addReply(c,shared.psubscribebulk);
     addReplyBulk(c,pattern);
     addReplyLongLong(c,clientSubscriptionsCount(c));
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
 /* Send the pubsub pattern unsubscription notification to the client.
@@ -166,8 +108,6 @@ void addReplyPubsubPatSubscribed(client *c, robj *pattern) {
  * punsubscribe command but there are no pattern to unsubscribe from: we
  * still send a notification. */
 void addReplyPubsubPatUnsubscribed(client *c, robj *pattern) {
-    uint64_t old_flags = c->flags;
-    c->flags |= CLIENT_PUSHING;
     if (c->resp == 2)
         addReply(c,shared.mbulkhdr[3]);
     else
@@ -178,183 +118,98 @@ void addReplyPubsubPatUnsubscribed(client *c, robj *pattern) {
     else
         addReplyNull(c);
     addReplyLongLong(c,clientSubscriptionsCount(c));
-    if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
 /*-----------------------------------------------------------------------------
  * Pubsub low level API
  *----------------------------------------------------------------------------*/
 
-/* Return the number of pubsub channels + patterns is handled. */
-int serverPubsubSubscriptionCount(void) {
-    return kvstoreSize(server.pubsub_channels) + dictSize(server.pubsub_patterns);
-}
-
-/* Return the number of pubsub shard level channels is handled. */
-int serverPubsubShardSubscriptionCount(void) {
-    return kvstoreSize(server.pubsubshard_channels);
-}
-
 /* Return the number of channels + patterns a client is subscribed to. */
 int clientSubscriptionsCount(client *c) {
-    return dictSize(c->pubsub_channels) + dictSize(c->pubsub_patterns);
-}
-
-/* Return the number of shard level channels a client is subscribed to. */
-int clientShardSubscriptionsCount(client *c) {
-    return dictSize(c->pubsubshard_channels);
-}
-
-dict* getClientPubSubChannels(client *c) {
-    return c->pubsub_channels;
-}
-
-dict* getClientPubSubShardChannels(client *c) {
-    return c->pubsubshard_channels;
-}
-
-/* Return the number of pubsub + pubsub shard level channels
- * a client is subscribed to. */
-int clientTotalPubSubSubscriptionCount(client *c) {
-    return clientSubscriptionsCount(c) + clientShardSubscriptionsCount(c);
-}
-
-void markClientAsPubSub(client *c) {
-    if (!(c->flags & CLIENT_PUBSUB)) {
-        c->flags |= CLIENT_PUBSUB;
-        server.pubsub_clients++;
-    }
-}
-
-void unmarkClientAsPubSub(client *c) {
-    if (c->flags & CLIENT_PUBSUB) {
-        c->flags &= ~CLIENT_PUBSUB;
-        server.pubsub_clients--;
-    }
+    return dictSize(c->pubsub_channels)+
+           listLength(c->pubsub_patterns);
 }
 
 /* Subscribe a client to a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was already subscribed to that channel. */
-int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
-    dictEntry *de, *existing;
-    dict *clients = NULL;
+int pubsubSubscribeChannel(client *c, robj *channel) {
+    dictEntry *de;
+    list *clients = NULL;
     int retval = 0;
-    unsigned int slot = 0;
 
     /* Add the channel to the client -> channels hash table */
-    void *position = dictFindPositionForInsert(type.clientPubSubChannels(c),channel,NULL);
-    if (position) { /* Not yet subscribed to this channel */
+    if (dictAdd(c->pubsub_channels,channel,NULL) == DICT_OK) {
         retval = 1;
-        /* Add the client to the channel -> list of clients hash table */
-        if (server.cluster_enabled && type.shard) {
-            slot = getKeySlot(channel->ptr);
-        }
-
-        de = kvstoreDictAddRaw(*type.serverPubSubChannels, slot, channel, &existing);
-
-        if (existing) {
-            clients = dictGetVal(existing);
-            channel = dictGetKey(existing);
-        } else {
-            clients = dictCreate(&clientDictType);
-            kvstoreDictSetVal(*type.serverPubSubChannels, slot, de, clients);
-            incrRefCount(channel);
-        }
-
-        serverAssert(dictAdd(clients, c, NULL) != DICT_ERR);
-        serverAssert(dictInsertAtPosition(type.clientPubSubChannels(c), channel, position));
         incrRefCount(channel);
+        /* Add the client to the channel -> list of clients hash table */
+        de = dictFind(server.pubsub_channels,channel);
+        if (de == NULL) {
+            clients = listCreate();
+            dictAdd(server.pubsub_channels,channel,clients);
+            incrRefCount(channel);
+        } else {
+            clients = dictGetVal(de);
+        }
+        listAddNodeTail(clients,c);
     }
     /* Notify the client */
-    addReplyPubsubSubscribed(c,channel,type);
+    addReplyPubsubSubscribed(c,channel);
     return retval;
 }
 
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was not subscribed to the specified channel. */
-int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype type) {
+int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
     dictEntry *de;
-    dict *clients;
+    list *clients;
+    listNode *ln;
     int retval = 0;
-    int slot = 0;
 
     /* Remove the channel from the client -> channels hash table */
     incrRefCount(channel); /* channel may be just a pointer to the same object
                             we have in the hash tables. Protect it... */
-    if (dictDelete(type.clientPubSubChannels(c),channel) == DICT_OK) {
+    if (dictDelete(c->pubsub_channels,channel) == DICT_OK) {
         retval = 1;
         /* Remove the client from the channel -> clients list hash table */
-        if (server.cluster_enabled && type.shard) {
-            slot = getKeySlot(channel->ptr);
-        }
-        de = kvstoreDictFind(*type.serverPubSubChannels, slot, channel);
+        de = dictFind(server.pubsub_channels,channel);
         serverAssertWithInfo(c,NULL,de != NULL);
         clients = dictGetVal(de);
-        serverAssertWithInfo(c, NULL, dictDelete(clients, c) == DICT_OK);
-        if (dictSize(clients) == 0) {
-            /* Free the dict and associated hash entry at all if this was
+        ln = listSearchKey(clients,c);
+        serverAssertWithInfo(c,NULL,ln != NULL);
+        listDelNode(clients,ln);
+        if (listLength(clients) == 0) {
+            /* Free the list and associated hash entry at all if this was
              * the latest client, so that it will be possible to abuse
              * Redis PUBSUB creating millions of channels. */
-            kvstoreDictDelete(*type.serverPubSubChannels, slot, channel);
+            dictDelete(server.pubsub_channels,channel);
         }
     }
     /* Notify the client */
-    if (notify) {
-        addReplyPubsubUnsubscribed(c,channel,type);
-    }
+    if (notify) addReplyPubsubUnsubscribed(c,channel);
     decrRefCount(channel); /* it is finally safe to release it */
     return retval;
-}
-
-/* Unsubscribe all shard channels in a slot. */
-void pubsubShardUnsubscribeAllChannelsInSlot(unsigned int slot) {
-    if (!kvstoreDictSize(server.pubsubshard_channels, slot))
-        return;
-
-    kvstoreDictIterator *kvs_di = kvstoreGetDictSafeIterator(server.pubsubshard_channels, slot);
-    dictEntry *de;
-    while ((de = kvstoreDictIteratorNext(kvs_di)) != NULL) {
-        robj *channel = dictGetKey(de);
-        dict *clients = dictGetVal(de);
-        /* For each client subscribed to the channel, unsubscribe it. */
-        dictIterator *iter = dictGetIterator(clients);
-        dictEntry *entry;
-        while ((entry = dictNext(iter)) != NULL) {
-            client *c = dictGetKey(entry);
-            int retval = dictDelete(c->pubsubshard_channels, channel);
-            serverAssertWithInfo(c,channel,retval == DICT_OK);
-            addReplyPubsubUnsubscribed(c, channel, pubSubShardType);
-            /* If the client has no other pubsub subscription,
-             * move out of pubsub mode. */
-            if (clientTotalPubSubSubscriptionCount(c) == 0) {
-                unmarkClientAsPubSub(c);
-            }
-        }
-        dictReleaseIterator(iter);
-        kvstoreDictDelete(server.pubsubshard_channels, slot, channel);
-    }
-    kvstoreReleaseDictIterator(kvs_di);
 }
 
 /* Subscribe a client to a pattern. Returns 1 if the operation succeeded, or 0 if the client was already subscribed to that pattern. */
 int pubsubSubscribePattern(client *c, robj *pattern) {
     dictEntry *de;
-    dict *clients;
+    list *clients;
     int retval = 0;
 
-    if (dictAdd(c->pubsub_patterns, pattern, NULL) == DICT_OK) {
+    if (listSearchKey(c->pubsub_patterns,pattern) == NULL) {
         retval = 1;
+        listAddNodeTail(c->pubsub_patterns,pattern);
         incrRefCount(pattern);
         /* Add the client to the pattern -> list of clients hash table */
         de = dictFind(server.pubsub_patterns,pattern);
         if (de == NULL) {
-            clients = dictCreate(&clientDictType);
+            clients = listCreate();
             dictAdd(server.pubsub_patterns,pattern,clients);
             incrRefCount(pattern);
         } else {
             clients = dictGetVal(de);
         }
-        serverAssert(dictAdd(clients, c, NULL) != DICT_ERR);
+        listAddNodeTail(clients,c);
     }
     /* Notify the client */
     addReplyPubsubPatSubscribed(c,pattern);
@@ -365,19 +220,23 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
  * 0 if the client was not subscribed to the specified channel. */
 int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
     dictEntry *de;
-    dict *clients;
+    list *clients;
+    listNode *ln;
     int retval = 0;
 
     incrRefCount(pattern); /* Protect the object. May be the same we remove */
-    if (dictDelete(c->pubsub_patterns, pattern) == DICT_OK) {
+    if ((ln = listSearchKey(c->pubsub_patterns,pattern)) != NULL) {
         retval = 1;
+        listDelNode(c->pubsub_patterns,ln);
         /* Remove the client from the pattern -> clients list hash table */
         de = dictFind(server.pubsub_patterns,pattern);
         serverAssertWithInfo(c,NULL,de != NULL);
         clients = dictGetVal(de);
-        serverAssertWithInfo(c, NULL, dictDelete(clients, c) == DICT_OK);
-        if (dictSize(clients) == 0) {
-            /* Free the dict and associated hash entry at all if this was
+        ln = listSearchKey(clients,c);
+        serverAssertWithInfo(c,NULL,ln != NULL);
+        listDelNode(clients,ln);
+        if (listLength(clients) == 0) {
+            /* Free the list and associated hash entry at all if this was
              * the latest client. */
             dictDelete(server.pubsub_patterns,pattern);
         }
@@ -390,116 +249,79 @@ int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
 
 /* Unsubscribe from all the channels. Return the number of channels the
  * client was subscribed to. */
-int pubsubUnsubscribeAllChannelsInternal(client *c, int notify, pubsubtype type) {
+int pubsubUnsubscribeAllChannels(client *c, int notify) {
+    dictIterator *di = dictGetSafeIterator(c->pubsub_channels);
+    dictEntry *de;
     int count = 0;
-    if (dictSize(type.clientPubSubChannels(c)) > 0) {
-        dictIterator *di = dictGetSafeIterator(type.clientPubSubChannels(c));
-        dictEntry *de;
 
-        while((de = dictNext(di)) != NULL) {
-            robj *channel = dictGetKey(de);
+    while((de = dictNext(di)) != NULL) {
+        robj *channel = dictGetKey(de);
 
-            count += pubsubUnsubscribeChannel(c,channel,notify,type);
-        }
-        dictReleaseIterator(di);
+        count += pubsubUnsubscribeChannel(c,channel,notify);
     }
     /* We were subscribed to nothing? Still reply to the client. */
-    if (notify && count == 0) {
-        addReplyPubsubUnsubscribed(c,NULL,type);
-    }
-    return count;
-}
-
-/*
- * Unsubscribe a client from all global channels.
- */
-int pubsubUnsubscribeAllChannels(client *c, int notify) {
-    int count = pubsubUnsubscribeAllChannelsInternal(c,notify,pubSubType);
-    return count;
-}
-
-/*
- * Unsubscribe a client from all shard subscribed channels.
- */
-int pubsubUnsubscribeShardAllChannels(client *c, int notify) {
-    int count = pubsubUnsubscribeAllChannelsInternal(c, notify, pubSubShardType);
+    if (notify && count == 0) addReplyPubsubUnsubscribed(c,NULL);
+    dictReleaseIterator(di);
     return count;
 }
 
 /* Unsubscribe from all the patterns. Return the number of patterns the
  * client was subscribed from. */
 int pubsubUnsubscribeAllPatterns(client *c, int notify) {
+    listNode *ln;
+    listIter li;
     int count = 0;
 
-    if (dictSize(c->pubsub_patterns) > 0) {
-        dictIterator *di = dictGetSafeIterator(c->pubsub_patterns);
-        dictEntry *de;
+    listRewind(c->pubsub_patterns,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        robj *pattern = ln->value;
 
-        while ((de = dictNext(di)) != NULL) {
-            robj *pattern = dictGetKey(de);
-            count += pubsubUnsubscribePattern(c, pattern, notify);
-        }
-        dictReleaseIterator(di);
+        count += pubsubUnsubscribePattern(c,pattern,notify);
     }
-
-    /* We were subscribed to nothing? Still reply to the client. */
     if (notify && count == 0) addReplyPubsubPatUnsubscribed(c,NULL);
     return count;
 }
 
-/*
- * Publish a message to all the subscribers.
- */
-int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) {
+/* Publish a message */
+int pubsubPublishMessage(robj *channel, robj *message) {
     int receivers = 0;
     dictEntry *de;
     dictIterator *di;
-    unsigned int slot = 0;
+    listNode *ln;
+    listIter li;
 
     /* Send to clients listening for that channel */
-    if (server.cluster_enabled && type.shard) {
-        slot = keyHashSlot(channel->ptr, sdslen(channel->ptr));
-    }
-    de = kvstoreDictFind(*type.serverPubSubChannels, slot, channel);
+    de = dictFind(server.pubsub_channels,channel);
     if (de) {
-        dict *clients = dictGetVal(de);
-        dictEntry *entry;
-        dictIterator *iter = dictGetIterator(clients);
-        while ((entry = dictNext(iter)) != NULL) {
-            client *c = dictGetKey(entry);
-            addReplyPubsubMessage(c,channel,message,*type.messageBulk);
-            updateClientMemUsageAndBucket(c);
+        list *list = dictGetVal(de);
+        listNode *ln;
+        listIter li;
+
+        listRewind(list,&li);
+        while ((ln = listNext(&li)) != NULL) {
+            client *c = ln->value;
+            addReplyPubsubMessage(c,channel,message);
             receivers++;
         }
-        dictReleaseIterator(iter);
     }
-
-    if (type.shard) {
-        /* Shard pubsub ignores patterns. */
-        return receivers;
-    }
-
     /* Send to clients listening to matching channels */
     di = dictGetIterator(server.pubsub_patterns);
     if (di) {
         channel = getDecodedObject(channel);
         while((de = dictNext(di)) != NULL) {
             robj *pattern = dictGetKey(de);
-            dict *clients = dictGetVal(de);
+            list *clients = dictGetVal(de);
             if (!stringmatchlen((char*)pattern->ptr,
                                 sdslen(pattern->ptr),
                                 (char*)channel->ptr,
                                 sdslen(channel->ptr),0)) continue;
 
-            dictEntry *entry;
-            dictIterator *iter = dictGetIterator(clients);
-            while ((entry = dictNext(iter)) != NULL) {
-                client *c = dictGetKey(entry);
+            listRewind(clients,&li);
+            while ((ln = listNext(&li)) != NULL) {
+                client *c = listNodeValue(ln);
                 addReplyPubsubPatMessage(c,pattern,channel,message);
-                updateClientMemUsageAndBucket(c);
                 receivers++;
             }
-            dictReleaseIterator(iter);
         }
         decrRefCount(channel);
         dictReleaseIterator(di);
@@ -507,9 +329,19 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     return receivers;
 }
 
-/* Publish a message to all the subscribers. */
-int pubsubPublishMessage(robj *channel, robj *message, int sharded) {
-    return pubsubPublishMessageInternal(channel, message, sharded? pubSubShardType : pubSubType);
+/* This wraps handling ACL channel permissions for the given client. */
+int pubsubCheckACLPermissionsOrReply(client *c, int idx, int count, int literal) {
+    /* Check if the user can run the command according to the current
+     * ACLs. */
+    int acl_chanpos;
+    int acl_retval = ACLCheckPubsubPerm(c,idx,count,literal,&acl_chanpos);
+    if (acl_retval == ACL_DENIED_CHANNEL) {
+        addACLLogEntry(c,acl_retval,acl_chanpos,NULL);
+        addReplyError(c,
+            "-NOPERM this user has no permissions to access "
+            "one of the channels used as arguments");
+    }
+    return acl_retval;
 }
 
 /*-----------------------------------------------------------------------------
@@ -519,23 +351,25 @@ int pubsubPublishMessage(robj *channel, robj *message, int sharded) {
 /* SUBSCRIBE channel [channel ...] */
 void subscribeCommand(client *c) {
     int j;
+    if (pubsubCheckACLPermissionsOrReply(c,1,c->argc-1,0) != ACL_OK) return;
     if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
         /**
          * A client that has CLIENT_DENY_BLOCKING flag on
          * expect a reply per command and so can not execute subscribe.
          *
          * Notice that we have a special treatment for multi because of
-         * backward compatibility
+         * backword compatibility
          */
         addReplyError(c, "SUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
     }
+
     for (j = 1; j < c->argc; j++)
-        pubsubSubscribeChannel(c,c->argv[j],pubSubType);
-    markClientAsPubSub(c);
+        pubsubSubscribeChannel(c,c->argv[j]);
+    c->flags |= CLIENT_PUBSUB;
 }
 
-/* UNSUBSCRIBE [channel ...] */
+/* UNSUBSCRIBE [channel [channel ...]] */
 void unsubscribeCommand(client *c) {
     if (c->argc == 1) {
         pubsubUnsubscribeAllChannels(c,1);
@@ -543,23 +377,22 @@ void unsubscribeCommand(client *c) {
         int j;
 
         for (j = 1; j < c->argc; j++)
-            pubsubUnsubscribeChannel(c,c->argv[j],1,pubSubType);
+            pubsubUnsubscribeChannel(c,c->argv[j],1);
     }
-    if (clientTotalPubSubSubscriptionCount(c) == 0) {
-        unmarkClientAsPubSub(c);
-    }
+    if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
 
 /* PSUBSCRIBE pattern [pattern ...] */
 void psubscribeCommand(client *c) {
     int j;
+    if (pubsubCheckACLPermissionsOrReply(c,1,c->argc-1,1) != ACL_OK) return;
     if ((c->flags & CLIENT_DENY_BLOCKING) && !(c->flags & CLIENT_MULTI)) {
         /**
          * A client that has CLIENT_DENY_BLOCKING flag on
          * expect a reply per command and so can not execute subscribe.
          *
          * Notice that we have a special treatment for multi because of
-         * backward compatibility
+         * backword compatibility
          */
         addReplyError(c, "PSUBSCRIBE isn't allowed for a DENY BLOCKING client");
         return;
@@ -567,7 +400,7 @@ void psubscribeCommand(client *c) {
 
     for (j = 1; j < c->argc; j++)
         pubsubSubscribePattern(c,c->argv[j]);
-    markClientAsPubSub(c);
+    c->flags |= CLIENT_PUBSUB;
 }
 
 /* PUNSUBSCRIBE [pattern [pattern ...]] */
@@ -580,29 +413,16 @@ void punsubscribeCommand(client *c) {
         for (j = 1; j < c->argc; j++)
             pubsubUnsubscribePattern(c,c->argv[j],1);
     }
-    if (clientTotalPubSubSubscriptionCount(c) == 0) {
-        unmarkClientAsPubSub(c);
-    }
-}
-
-/* This function wraps pubsubPublishMessage and also propagates the message to cluster.
- * Used by the commands PUBLISH/SPUBLISH and their respective module APIs.*/
-int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int sharded) {
-    int receivers = pubsubPublishMessage(channel, message, sharded);
-    if (server.cluster_enabled)
-        clusterPropagatePublish(channel, message, sharded);
-    return receivers;
+    if (clientSubscriptionsCount(c) == 0) c->flags &= ~CLIENT_PUBSUB;
 }
 
 /* PUBLISH <channel> <message> */
 void publishCommand(client *c) {
-    if (server.sentinel_mode) {
-        sentinelPublishCommand(c);
-        return;
-    }
-
-    int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1],c->argv[2],0);
-    if (!server.cluster_enabled)
+    if (pubsubCheckACLPermissionsOrReply(c,1,1,0) != ACL_OK) return;
+    int receivers = pubsubPublishMessage(c->argv[1],c->argv[2]);
+    if (server.cluster_enabled)
+        clusterPropagatePublish(c->argv[1],c->argv[2]);
+    else
         forceCommandPropagation(c,PROPAGATE_REPL);
     addReplyLongLong(c,receivers);
 }
@@ -618,10 +438,6 @@ void pubsubCommand(client *c) {
 "NUMSUB [<channel> ...]",
 "    Return the number of subscribers for the specified channels, excluding",
 "    pattern subscriptions(default: no channels).",
-"SHARDCHANNELS [<pattern>]",
-"    Return the currently active shard level channels matching a <pattern> (default: '*').",
-"SHARDNUMSUB [<shardchannel> ...]",
-"    Return the number of subscribers for the specified shard level channel(s)",
 NULL
         };
         addReplyHelp(c, help);
@@ -630,119 +446,40 @@ NULL
     {
         /* PUBSUB CHANNELS [<pattern>] */
         sds pat = (c->argc == 2) ? NULL : c->argv[2]->ptr;
-        channelList(c, pat, server.pubsub_channels);
+        dictIterator *di = dictGetIterator(server.pubsub_channels);
+        dictEntry *de;
+        long mblen = 0;
+        void *replylen;
+
+        replylen = addReplyDeferredLen(c);
+        while((de = dictNext(di)) != NULL) {
+            robj *cobj = dictGetKey(de);
+            sds channel = cobj->ptr;
+
+            if (!pat || stringmatchlen(pat, sdslen(pat),
+                                       channel, sdslen(channel),0))
+            {
+                addReplyBulk(c,cobj);
+                mblen++;
+            }
+        }
+        dictReleaseIterator(di);
+        setDeferredArrayLen(c,replylen,mblen);
     } else if (!strcasecmp(c->argv[1]->ptr,"numsub") && c->argc >= 2) {
         /* PUBSUB NUMSUB [Channel_1 ... Channel_N] */
         int j;
 
         addReplyArrayLen(c,(c->argc-2)*2);
         for (j = 2; j < c->argc; j++) {
-            dict *d = kvstoreDictFetchValue(server.pubsub_channels, 0, c->argv[j]);
+            list *l = dictFetchValue(server.pubsub_channels,c->argv[j]);
 
             addReplyBulk(c,c->argv[j]);
-            addReplyLongLong(c, d ? dictSize(d) : 0);
+            addReplyLongLong(c,l ? listLength(l) : 0);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"numpat") && c->argc == 2) {
         /* PUBSUB NUMPAT */
         addReplyLongLong(c,dictSize(server.pubsub_patterns));
-    } else if (!strcasecmp(c->argv[1]->ptr,"shardchannels") &&
-        (c->argc == 2 || c->argc == 3)) 
-    {
-        /* PUBSUB SHARDCHANNELS */
-        sds pat = (c->argc == 2) ? NULL : c->argv[2]->ptr;
-        channelList(c,pat,server.pubsubshard_channels);
-    } else if (!strcasecmp(c->argv[1]->ptr,"shardnumsub") && c->argc >= 2) {
-        /* PUBSUB SHARDNUMSUB [ShardChannel_1 ... ShardChannel_N] */
-        int j;
-        addReplyArrayLen(c, (c->argc-2)*2);
-        for (j = 2; j < c->argc; j++) {
-            unsigned int slot = calculateKeySlot(c->argv[j]->ptr);
-            dict *clients = kvstoreDictFetchValue(server.pubsubshard_channels, slot, c->argv[j]);
-
-            addReplyBulk(c,c->argv[j]);
-            addReplyLongLong(c, clients ? dictSize(clients) : 0);
-        }
     } else {
         addReplySubcommandSyntaxError(c);
     }
-}
-
-void channelList(client *c, sds pat, kvstore *pubsub_channels) {
-    long mblen = 0;
-    void *replylen;
-    unsigned int slot_cnt = kvstoreNumDicts(pubsub_channels);
-
-    replylen = addReplyDeferredLen(c);
-    for (unsigned int i = 0; i < slot_cnt; i++) {
-        if (!kvstoreDictSize(pubsub_channels, i))
-            continue;
-        kvstoreDictIterator *kvs_di = kvstoreGetDictIterator(pubsub_channels, i);
-        dictEntry *de;
-        while((de = kvstoreDictIteratorNext(kvs_di)) != NULL) {
-            robj *cobj = dictGetKey(de);
-            sds channel = cobj->ptr;
-
-            if (!pat || stringmatchlen(pat, sdslen(pat),
-                                    channel, sdslen(channel),0))
-            {
-                addReplyBulk(c,cobj);
-                mblen++;
-            }
-        }
-        kvstoreReleaseDictIterator(kvs_di);
-    }
-    setDeferredArrayLen(c,replylen,mblen);
-}
-
-/* SPUBLISH <shardchannel> <message> */
-void spublishCommand(client *c) {
-    int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1],c->argv[2],1);
-    if (!server.cluster_enabled)
-        forceCommandPropagation(c,PROPAGATE_REPL);
-    addReplyLongLong(c,receivers);
-}
-
-/* SSUBSCRIBE shardchannel [shardchannel ...] */
-void ssubscribeCommand(client *c) {
-    if (c->flags & CLIENT_DENY_BLOCKING) {
-        /* A client that has CLIENT_DENY_BLOCKING flag on
-         * expect a reply per command and so can not execute subscribe. */
-        addReplyError(c, "SSUBSCRIBE isn't allowed for a DENY BLOCKING client");
-        return;
-    }
-
-    for (int j = 1; j < c->argc; j++) {
-        pubsubSubscribeChannel(c, c->argv[j], pubSubShardType);
-    }
-    markClientAsPubSub(c);
-}
-
-/* SUNSUBSCRIBE [shardchannel [shardchannel ...]] */
-void sunsubscribeCommand(client *c) {
-    if (c->argc == 1) {
-        pubsubUnsubscribeShardAllChannels(c, 1);
-    } else {
-        for (int j = 1; j < c->argc; j++) {
-            pubsubUnsubscribeChannel(c, c->argv[j], 1, pubSubShardType);
-        }
-    }
-    if (clientTotalPubSubSubscriptionCount(c) == 0) {
-        unmarkClientAsPubSub(c);
-    }
-}
-
-size_t pubsubMemOverhead(client *c) {
-    /* PubSub patterns */
-    size_t mem = dictMemUsage(c->pubsub_patterns);
-    /* Global PubSub channels */
-    mem += dictMemUsage(c->pubsub_channels);
-    /* Sharded PubSub channels */
-    mem += dictMemUsage(c->pubsubshard_channels);
-    return mem;
-}
-
-int pubsubTotalSubscriptions(void) {
-    return dictSize(server.pubsub_patterns) +
-           kvstoreSize(server.pubsub_channels) +
-           kvstoreSize(server.pubsubshard_channels);
 }

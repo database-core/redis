@@ -1,4 +1,4 @@
-/* This is a small program used in order to understand the collision rate
+/* This is a small program used in order to understand the collison rate
  * of CRC64 (ISO version) VS other stronger hashing functions in the context
  * of hashing keys for the Redis "tracking" feature (client side caching
  * assisted by the server).
@@ -7,7 +7,7 @@
  *
  *  prefix:<counter>
  *
- * And counts the resulting collisions generated in the 24 bits of output
+ * And counts the resulting collisons generated in the 24 bits of output
  * needed for the tracking feature invalidation table (16 millions + entries)
  *
  * Compile with:
@@ -17,10 +17,8 @@
  *
  * --------------------------------------------------------------------------
  *
- * Copyright (C) 2019-Present Redis Ltd. All rights reserved.
- *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Copyright (C) 2019 Salvatore Sanfilippo
+ * This code is released under the BSD 2 clause license.
  */
 
 #include <stdlib.h>

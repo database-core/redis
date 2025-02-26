@@ -18,27 +18,14 @@ proc find_non_empty_master {} {
     foreach_redis_id id {
         if {[RI $id role] eq {master} && [R $id dbsize] > 0} {
             set master_id_no $id
-            break
         }
     }
     return $master_id_no
 }
 
 proc get_one_of_my_replica {id} {
-    wait_for_condition 1000 50 {
-        [llength [lindex [R $id role] 2]] > 0
-    } else {
-        fail "replicas didn't connect"
-    }
     set replica_port [lindex [lindex [lindex [R $id role] 2] 0] 1]
     set replica_id_num [get_instance_id_by_port redis $replica_port]
-
-    # To avoid -LOADING reply, wait until replica syncs with master.
-    wait_for_condition 1000 50 {
-        [RI $replica_id_num master_link_status] eq {up}
-    } else {
-        fail "Replica did not sync in time."
-    }
     return $replica_id_num
 }
 
@@ -66,7 +53,7 @@ proc test_slave_load_expired_keys {aof} {
 
         # config the replica persistency and rewrite the config file to survive restart
         # note that this needs to be done before populating the volatile keys since
-        # that triggers and AOFRW, and we rather the AOF file to have 'SET PXAT' commands
+        # that triggers and AOFRW, and we rather the AOF file to have SETEX commands
         # rather than an RDB with volatile keys
         R $replica_id config set appendonly $aof
         R $replica_id config rewrite
@@ -77,7 +64,6 @@ proc test_slave_load_expired_keys {aof} {
 
         # wait for replica to be in sync with master
         wait_for_condition 500 10 {
-            [RI $replica_id master_link_status] eq {up} &&
             [R $replica_id dbsize] eq [R $master_id dbsize]
         } else {
             fail "replica didn't sync"
@@ -91,10 +77,9 @@ proc test_slave_load_expired_keys {aof} {
             # we need to wait for the initial AOFRW to be done, otherwise
             # kill_instance (which now uses SIGTERM will fail ("Writing initial AOF, can't exit")
             wait_for_condition 100 10 {
-                [RI $replica_id aof_rewrite_scheduled] eq 0 &&
                 [RI $replica_id aof_rewrite_in_progress] eq 0
             } else {
-                fail "AOFRW didn't finish"
+                fail "keys didn't expire"
             }
         } else {
             R $replica_id save
@@ -112,15 +97,8 @@ proc test_slave_load_expired_keys {aof} {
         # start the replica again (loading an RDB or AOF file)
         restart_instance redis $replica_id
 
-        # Replica may start a full sync after restart, trying in a loop to avoid
-        # -LOADING reply in that case.
-        wait_for_condition 1000 50 {
-            [catch {set replica_dbsize_3 [R $replica_id dbsize]} e] == 0
-        } else {
-            fail "Replica is not up."
-        }
-
         # make sure the keys are still there
+        set replica_dbsize_3 [R $replica_id dbsize]
         assert {$replica_dbsize_3 > $replica_dbsize_0}
         
         # restore settings
@@ -128,7 +106,6 @@ proc test_slave_load_expired_keys {aof} {
 
         # wait for the master to expire all keys and replica to get the DELs
         wait_for_condition 500 10 {
-            [RI $replica_id master_link_status] eq {up} &&
             [R $replica_id dbsize] eq $master_dbsize_0
         } else {
             fail "keys didn't expire"

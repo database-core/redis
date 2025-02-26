@@ -4,7 +4,7 @@
    Copyright (c) 2012-2016 Jean-Philippe Aumasson
    <jeanphilippe.aumasson@gmail.com>
    Copyright (c) 2012-2014 Daniel J. Bernstein <djb@cr.yp.to>
-   Copyright (c) 2017-current Redis Ltd.
+   Copyright (c) 2017 Salvatore Sanfilippo <antirez@gmail.com>
 
    To the extent possible under law, the author(s) have dedicated all copyright
    and related and neighboring rights to this software to the public domain
@@ -39,6 +39,7 @@
       the function in the new form (returning an uint64_t) using just the
       relevant test vector.
  */
+#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -53,16 +54,6 @@ int siptlw(int c) {
         return c;
     }
 }
-
-#if defined(__has_attribute)
-#if __has_attribute(no_sanitize)
-#define NO_SANITIZE(sanitizer) __attribute__((no_sanitize(sanitizer)))
-#endif
-#endif
-
-#if !defined(NO_SANITIZE)
-#define NO_SANITIZE(sanitizer)
-#endif
 
 /* Test of the CPU is Little Endian and supports not aligned accesses.
  * Two interesting conditions to speedup the function that happen to be
@@ -122,7 +113,6 @@ int siptlw(int c) {
         v2 = ROTL(v2, 32);                                                     \
     } while (0)
 
-NO_SANITIZE("alignment")
 uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
 #ifndef UNALIGNED_LE_CPU
     uint64_t hash;
@@ -182,7 +172,6 @@ uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k) {
 #endif
 }
 
-NO_SANITIZE("alignment")
 uint64_t siphash_nocase(const uint8_t *in, const size_t inlen, const uint8_t *k)
 {
 #ifndef UNALIGNED_LE_CPU

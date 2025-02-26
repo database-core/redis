@@ -1,10 +1,31 @@
 /* adlist.c - A generic doubly linked list implementation
  *
- * Copyright (c) 2006-Present, Redis Ltd.
+ * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 
@@ -55,15 +76,8 @@ void listEmpty(list *list)
  * This function can't fail. */
 void listRelease(list *list)
 {
-    if (!list)
-        return;
     listEmpty(list);
     zfree(list);
-}
-
-/* Generic version of listRelease. */
-void listReleaseGeneric(void *list) {
-    listRelease((struct list*)list);
 }
 
 /* Add a new node to the list, to head, containing the specified 'value'
@@ -79,14 +93,6 @@ list *listAddNodeHead(list *list, void *value)
     if ((node = zmalloc(sizeof(*node))) == NULL)
         return NULL;
     node->value = value;
-    listLinkNodeHead(list, node);
-    return list;
-}
-
-/*
- * Add a node that has already been allocated to the head of list
- */
-void listLinkNodeHead(list* list, listNode *node) {
     if (list->len == 0) {
         list->head = list->tail = node;
         node->prev = node->next = NULL;
@@ -97,6 +103,7 @@ void listLinkNodeHead(list* list, listNode *node) {
         list->head = node;
     }
     list->len++;
+    return list;
 }
 
 /* Add a new node to the list, to tail, containing the specified 'value'
@@ -112,14 +119,6 @@ list *listAddNodeTail(list *list, void *value)
     if ((node = zmalloc(sizeof(*node))) == NULL)
         return NULL;
     node->value = value;
-    listLinkNodeTail(list, node);
-    return list;
-}
-
-/*
- * Add a node that has already been allocated to the tail of list
- */
-void listLinkNodeTail(list *list, listNode *node) {
     if (list->len == 0) {
         list->head = list->tail = node;
         node->prev = node->next = NULL;
@@ -130,6 +129,7 @@ void listLinkNodeTail(list *list, listNode *node) {
         list->tail = node;
     }
     list->len++;
+    return list;
 }
 
 list *listInsertNode(list *list, listNode *old_node, void *value, int after) {
@@ -162,20 +162,11 @@ list *listInsertNode(list *list, listNode *old_node, void *value, int after) {
 }
 
 /* Remove the specified node from the specified list.
- * The node is freed. If free callback is provided the value is freed as well.
+ * It's up to the caller to free the private value of the node.
  *
  * This function can't fail. */
 void listDelNode(list *list, listNode *node)
 {
-    listUnlinkNode(list, node);
-    if (list->free) list->free(node->value);
-    zfree(node);
-}
-
-/*
- * Remove the specified node from the list without freeing it.
- */
-void listUnlinkNode(list *list, listNode *node) {
     if (node->prev)
         node->prev->next = node->next;
     else
@@ -184,10 +175,8 @@ void listUnlinkNode(list *list, listNode *node) {
         node->next->prev = node->prev;
     else
         list->tail = node->prev;
-
-    node->next = NULL;
-    node->prev = NULL;
-
+    if (list->free) list->free(node->value);
+    zfree(node);
     list->len--;
 }
 
@@ -280,14 +269,9 @@ list *listDup(list *orig)
                 listRelease(copy);
                 return NULL;
             }
-        } else {
+        } else
             value = node->value;
-        }
-        
         if (listAddNodeTail(copy, value) == NULL) {
-            /* Free value if dup succeed but listAddNodeTail failed. */
-            if (copy->free) copy->free(value);
-
             listRelease(copy);
             return NULL;
         }
@@ -391,13 +375,4 @@ void listJoin(list *l, list *o) {
     /* Setup other as an empty list. */
     o->head = o->tail = NULL;
     o->len = 0;
-}
-
-/* Initializes the node's value and sets its pointers
- * so that it is initially not a member of any list.
- */
-void listInitNode(listNode *node, void *value) {
-    node->prev = NULL;
-    node->next = NULL;
-    node->value = value;
 }

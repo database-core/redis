@@ -1,14 +1,36 @@
 /*
- * Copyright (c) 2009-Present, Redis Ltd.
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
- * Licensed under your choice of the Redis Source Available License 2.0
- * (RSALv2) or the Server Side Public License v1 (SSPLv1).
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 #include <limits.h>
 #include <errno.h>
 #include <termios.h>
@@ -17,7 +39,6 @@
 #include <stropts.h>
 #endif
 #include "config.h"
-#include "redisassert.h"
 
 #if (ULONG_MAX == 4294967295UL)
 #define MEMTEST_32BIT
@@ -35,16 +56,6 @@
 #define ULONG_ZEROONE 0x5555555555555555UL
 #endif
 
-#if defined(__has_attribute)
-#if __has_attribute(no_sanitize)
-#define NO_SANITIZE(sanitizer) __attribute__((no_sanitize(sanitizer)))
-#endif
-#endif
-
-#if !defined(NO_SANITIZE)
-#define NO_SANITIZE(sanitizer)
-#endif
-
 static struct winsize ws;
 size_t progress_printed; /* Printed chars in screen-wide progress bar. */
 size_t progress_full; /* How many chars to write to fill the progress bar. */
@@ -60,7 +71,7 @@ void memtest_progress_start(char *title, int pass) {
     printf("\x1b[H\x1b[2K");          /* Cursor home, clear current line.  */
     printf("%s [%d]\n", title, pass); /* Print title. */
     progress_printed = 0;
-    progress_full = (size_t)ws.ws_col*(ws.ws_row-3);
+    progress_full = ws.ws_col*(ws.ws_row-3);
     fflush(stdout);
 }
 
@@ -266,8 +277,6 @@ int memtest_test(unsigned long *m, size_t bytes, int passes, int interactive) {
  * end of the region between fill and compare cycles in order to trash
  * the cache. */
 #define MEMTEST_DECACHE_SIZE (1024*8)
-
-NO_SANITIZE("undefined")
 int memtest_preserving_test(unsigned long *m, size_t bytes, int passes) {
     unsigned long backup[MEMTEST_BACKUP_WORDS];
     unsigned long *p = m;

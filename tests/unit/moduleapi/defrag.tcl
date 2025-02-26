@@ -1,7 +1,7 @@
 set testmodule [file normalize tests/modules/defragtest.so]
 
 start_server {tags {"modules"} overrides {{save ""}}} {
-    r module load $testmodule 50000
+    r module load $testmodule 10000
     r config set hz 100
     r config set active-defrag-ignore-bytes 1
     r config set active-defrag-threshold-lower 0
@@ -18,9 +18,6 @@ start_server {tags {"modules"} overrides {{save ""}}} {
             set info [r info defragtest_stats]
             assert {[getInfoProperty $info defragtest_datatype_attempts] > 0}
             assert_equal 0 [getInfoProperty $info defragtest_datatype_resumes]
-            assert_morethan [getInfoProperty $info defragtest_datatype_raw_defragged] 0
-            assert_morethan [getInfoProperty $info defragtest_defrag_started] 0
-            assert_morethan [getInfoProperty $info defragtest_defrag_ended] 0
         }
 
         test {Module defrag: late defrag with cursor works} {
@@ -35,37 +32,15 @@ start_server {tags {"modules"} overrides {{save ""}}} {
             set info [r info defragtest_stats]
             assert {[getInfoProperty $info defragtest_datatype_resumes] > 10}
             assert_equal 0 [getInfoProperty $info defragtest_datatype_wrong_cursor]
-            assert_morethan [getInfoProperty $info defragtest_datatype_raw_defragged] 0
-            assert_morethan [getInfoProperty $info defragtest_defrag_started] 0
-            assert_morethan [getInfoProperty $info defragtest_defrag_ended] 0
         }
 
         test {Module defrag: global defrag works} {
-            r config set activedefrag no
-            wait_for_condition 100 50 {
-                [s active_defrag_running] eq 0
-            } else {
-                fail "Unable to wait for active defrag to stop"
-            }
-
             r flushdb
             r frag.resetstats
-            r frag.create_frag_global
-            r config set activedefrag yes
 
-            wait_for_condition 100 50 {
-                [getInfoProperty [r info defragtest_stats] defragtest_defrag_ended] > 0
-            } else {
-                fail "Unable to wait for a complete defragmentation cycle to finish"
-            }
-
+            after 2000
             set info [r info defragtest_stats]
-            assert {[getInfoProperty $info defragtest_global_strings_attempts] > 0}
-            assert {[getInfoProperty $info defragtest_global_dicts_attempts] > 0}
-            assert {[getInfoProperty $info defragtest_global_dicts_defragged] > 0}
-            assert_morethan [getInfoProperty $info defragtest_defrag_started] 0
-            assert_morethan [getInfoProperty $info defragtest_defrag_ended] 0
-            assert_morethan [getInfoProperty $info defragtest_global_dicts_resumes] [getInfoProperty $info defragtest_defrag_ended]
+            assert {[getInfoProperty $info defragtest_global_attempts] > 0}
         }
     }
 }

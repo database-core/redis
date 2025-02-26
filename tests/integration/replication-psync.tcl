@@ -1,16 +1,3 @@
-#
-# Copyright (c) 2009-Present, Redis Ltd.
-# All rights reserved.
-#
-# Copyright (c) 2024-present, Valkey contributors.
-# All rights reserved.
-#
-# Licensed under your choice of the Redis Source Available License 2.0
-# (RSALv2) or the Server Side Public License v1 (SSPLv1).
-#
-# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
-#
-
 # Creates a master-slave pair and breaks the link continuously to force
 # partial resyncs attempts, all this while flooding the master with
 # write queries.
@@ -21,9 +8,9 @@
 # If reconnect is > 0, the test actually try to break the connection and
 # reconnect with the master, otherwise just the initial synchronization is
 # checked for consistency.
-proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reconnect rdbchannel} {
-    start_server {tags {"repl"} overrides {save {}}} {
-        start_server {overrides {save {}}} {
+proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reconnect} {
+    start_server {tags {"repl"}} {
+        start_server {} {
 
             set master [srv -1 client]
             set master_host [srv -1 host]
@@ -34,9 +21,7 @@ proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reco
             $master config set repl-backlog-ttl $backlog_ttl
             $master config set repl-diskless-sync $mdl
             $master config set repl-diskless-sync-delay 1
-            $master config set repl-rdb-channel $rdbchannel
             $slave config set repl-diskless-load $sdl
-            $slave config set repl-rdb-channel $rdbchannel
 
             set load_handle0 [start_bg_complex_data $master_host $master_port 9 100000]
             set load_handle1 [start_bg_complex_data $master_host $master_port 11 100000]
@@ -61,7 +46,7 @@ proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reco
                 }
             }
 
-            test "Test replication partial resync: $descr (diskless: $mdl, $sdl, reconnect: $reconnect, rdbchannel: $rdbchannel)" {
+            test "Test replication partial resync: $descr (diskless: $mdl, $sdl, reconnect: $reconnect)" {
                 # Now while the clients are writing data, break the maste-slave
                 # link multiple times.
                 if ($reconnect) {
@@ -112,9 +97,15 @@ proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reco
                     fail "Slave still not connected after some time"
                 }  
 
-                wait_for_condition 100 100 {
-                    [$master debug digest] == [$slave debug digest]
-                } else {
+                set retry 10
+                while {$retry && ([$master debug digest] ne [$slave debug digest])}\
+                {
+                    after 1000
+                    incr retry -1
+                }
+                assert {[$master dbsize] > 0}
+
+                if {[$master debug digest] ne [$slave debug digest]} {
                     set csv1 [csvdump r]
                     set csv2 [csvdump {r -1}]
                     set fd [open /tmp/repldump1.txt w]
@@ -123,43 +114,35 @@ proc test_psync {descr duration backlog_size backlog_ttl delay cond mdl sdl reco
                     set fd [open /tmp/repldump2.txt w]
                     puts -nonewline $fd $csv2
                     close $fd
-                    fail "Master - Replica inconsistency, Run diff -u against /tmp/repldump*.txt for more info"
+                    puts "Master - Replica inconsistency"
+                    puts "Run diff -u against /tmp/repldump*.txt for more info"
                 }
-                assert {[$master dbsize] > 0}
+                assert_equal [r debug digest] [r -1 debug digest]
                 eval $cond
             }
         }
     }
 }
 
-tags {"external:skip"} {
 foreach mdl {no yes} {
     foreach sdl {disabled swapdb} {
-        foreach rdbchannel {yes no} {
-            if {$rdbchannel == "yes" && $mdl == "no"} {
-                # rdbchannel replication requires repl-diskless-sync enabled
-                continue
-            }
+        test_psync {no reconnection, just sync} 6 1000000 3600 0 {
+        } $mdl $sdl 0
 
-            test_psync {no reconnection, just sync} 6 1000000 3600 0 {
-            } $mdl $sdl 0 $rdbchannel
+        test_psync {ok psync} 6 100000000 3600 0 {
+        assert {[s -1 sync_partial_ok] > 0}
+        } $mdl $sdl 1
 
-            test_psync {ok psync} 6 100000000 3600 0 {
-            assert {[s -1 sync_partial_ok] > 0}
-            } $mdl $sdl 1 $rdbchannel
+        test_psync {no backlog} 6 100 3600 0.5 {
+        assert {[s -1 sync_partial_err] > 0}
+        } $mdl $sdl 1
 
-            test_psync {no backlog} 6 100 3600 0.5 {
-            assert {[s -1 sync_partial_err] > 0}
-            } $mdl $sdl 1 $rdbchannel
+        test_psync {ok after delay} 3 100000000 3600 3 {
+        assert {[s -1 sync_partial_ok] > 0}
+        } $mdl $sdl 1
 
-            test_psync {ok after delay} 3 100000000 3600 3 {
-            assert {[s -1 sync_partial_ok] > 0}
-            } $mdl $sdl 1 $rdbchannel
-
-            test_psync {backlog expired} 3 100000000 1 3 {
-            assert {[s -1 sync_partial_err] > 0}
-            } $mdl $sdl 1 $rdbchannel
-        }
+        test_psync {backlog expired} 3 100000000 1 3 {
+        assert {[s -1 sync_partial_err] > 0}
+        } $mdl $sdl 1
     }
-}
 }

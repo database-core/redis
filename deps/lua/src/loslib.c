@@ -234,17 +234,10 @@ static const luaL_Reg syslib[] = {
 
 /* }====================================================== */
 
-#define UNUSED(V) ((void) V)
 
-/* Only a subset is loaded currently, for sandboxing concerns. */
-static const luaL_Reg sandbox_syslib[] = {
-  {"clock",     os_clock},
-  {NULL, NULL}
-};
 
 LUALIB_API int luaopen_os (lua_State *L) {
-  UNUSED(syslib);
-  luaL_register(L, LUA_OSLIBNAME, sandbox_syslib);
+  luaL_register(L, LUA_OSLIBNAME, syslib);
   return 1;
 }
 

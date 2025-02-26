@@ -1,8 +1,7 @@
-start_server {tags {"repl external:skip"}} {
+start_server {tags {"repl"}} {
     start_server {} {
         test {First server should have role slave after SLAVEOF} {
             r -1 slaveof [srv 0 host] [srv 0 port]
-            wait_replica_online r
             wait_for_condition 50 100 {
                 [s -1 master_link_status] eq {up}
             } else {
@@ -42,7 +41,7 @@ start_server {tags {"repl external:skip"}} {
         test {No write if min-slaves-max-lag is > of the slave lag} {
             r config set min-slaves-to-write 1
             r config set min-slaves-max-lag 2
-            pause_process [srv -1 pid]
+            exec kill -SIGSTOP [srv -1 pid]
             assert {[r set foo 12345] eq {OK}}
             wait_for_condition 100 100 {
                 [catch {r set foo 12345}] != 0
@@ -52,7 +51,7 @@ start_server {tags {"repl external:skip"}} {
             catch {r set foo 12345} err
             assert_match {NOREPLICAS*} $err
         }
-        resume_process [srv -1 pid]
+        exec kill -SIGCONT [srv -1 pid]
 
         test {min-slaves-to-write is ignored by slaves} {
             r config set min-slaves-to-write 1
