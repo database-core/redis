@@ -103,9 +103,9 @@ struct connection {
     unsigned short int iovcnt;
     void *private_data;
     struct aeEventLoop *el;
-    ConnectionCallbackFunc conn_handler;
-    ConnectionCallbackFunc write_handler;
-    ConnectionCallbackFunc read_handler;
+    ConnectionCallbackFunc conn_handler;  // 传输层的连接
+    ConnectionCallbackFunc write_handler; // 网络抽象，应用层IO读
+    ConnectionCallbackFunc read_handler;  // 应用层写
 };
 
 #define CONFIG_BINDADDR_MAX 16

@@ -448,6 +448,9 @@ static int evictionTimeProc(
     return AE_NOMORE;
 }
 
+/**
+ * 主eventloop注册注册事件源
+ */
 void startEvictionTimeProc(void) {
     if (!isEvictionProcRunning) {
         isEvictionProcRunning = 1;

@@ -127,6 +127,8 @@ client *createClient(connection *conn) {
         connEnableTcpNoDelay(conn);
         if (server.tcpkeepalive)
             connKeepAlive(conn,server.tcpkeepalive);
+        // 应用层的IO回调函数
+        // 创建client时，注册读IO回调函数
         connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
     }
@@ -1384,6 +1386,12 @@ void clientAcceptHandler(connection *conn) {
     if (server.io_threads_num > 1) assignClientToIOThread(c);
 }
 
+/**
+ * on accepted. 在哪里对新连接注册 epoll?
+ * @param conn
+ * @param flags
+ * @param ip
+ */
 void acceptCommonHandler(connection *conn, int flags, char *ip) {
     client *c;
     UNUSED(ip);
@@ -2084,6 +2092,12 @@ static inline int _writeToClientSlave(client *c, ssize_t *nwritten) {
     return C_OK;
 }
 
+/**
+ * 应用层IO处理函数 => 应用层写缓冲里的数据 写入到网络层缓冲区
+ * @param c
+ * @param handler_installed
+ * @return
+ */
 /* Write data in output buffers to client. Return C_OK if the client
  * is still valid after the call, C_ERR if it was freed because of some
  * error.  If handler_installed is set, it will attempt to clear the
@@ -2180,6 +2194,9 @@ int writeToClient(client *c, int handler_installed) {
     return C_OK;
 }
 
+/**
+ * 应用层的IO写事件回调
+ */
 /* Write event handler. Just send data to the client. */
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
@@ -2878,6 +2895,10 @@ int processInputBuffer(client *c) {
     return C_OK;
 }
 
+/**
+ * 应用层的IO读回调(读IO + 业务处理 + 写Buffer)
+ * @param conn
+ */
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     int nread, big_arg = 0;
@@ -2995,6 +3016,7 @@ void readQueryFromClient(connection *conn) {
         goto done;
     }
 
+    // 业务处理
     /* There is more data in the client input buffer, continue parsing it
      * and check if there is a full command to execute. */
     if (processInputBuffer(c) == C_ERR)

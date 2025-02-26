@@ -74,17 +74,21 @@ typedef struct aeFiredEvent {
     int mask;
 } aeFiredEvent;
 
+/**
+ * epoll抽象
+ * 事件源抽象(epoll，双工；时间事件，单工；消息事件，单工)
+ */
 /* State of an event based program */
 typedef struct aeEventLoop {
     int maxfd;   /* highest file descriptor currently registered */
     int setsize; /* max number of file descriptors tracked */
     long long timeEventNextId;
     int nevents; /* Size of Registered events */
-    aeFileEvent *events; /* Registered events */
+    aeFileEvent *events; /* Registered events fd池 */
     aeFiredEvent *fired; /* Fired events */
     aeTimeEvent *timeEventHead;
     int stop;
-    void *apidata; /* This is used for polling API specific data */
+    void *apidata; /* This is used for polling API specific data */ // epoll抽象
     aeBeforeSleepProc *beforesleep;
     aeBeforeSleepProc *aftersleep;
     int flags;

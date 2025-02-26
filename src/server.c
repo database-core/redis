@@ -2945,7 +2945,7 @@ void initListeners(void) {
             serverLog(LL_WARNING, "Failed listening on port %u (%s), aborting.", listener->port, listener->ct->get_type(NULL));
             exit(1);
         }
-
+        // 创建连接
         if (createSocketAcceptHandler(listener, connAcceptHandler(listener->ct)) != C_OK)
             serverPanic("Unrecoverable error creating %s listener accept handler.", listener->ct->get_type(NULL));
 
@@ -3974,6 +3974,8 @@ uint64_t getCommandFlags(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    // 脚本模块
+    // 各个模块相互耦合
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
          * no way in_exec or scriptIsRunning() is 1.
@@ -3993,6 +3995,7 @@ int processCommand(client *c) {
         reqresAppendRequest(c);
     }
 
+    // 性能敏感性 => 高度业务耦合 => 相互做协调
     /* If we're inside a module blocked context yielding that wants to avoid
      * processing clients, postpone the command. */
     if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
@@ -4073,6 +4076,7 @@ int processCommand(client *c) {
                                         (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_NO_ASYNC_LOADING));
     int obey_client = mustObeyClient(c);
 
+    // 权限模块
     if (authRequired(c)) {
         /* AUTH and HELLO and no auth commands are valid even in
          * non-authenticated state. */
@@ -4082,11 +4086,13 @@ int processCommand(client *c) {
         }
     }
 
+    // 事务和流水线模块 | 计算模式不同
     if (c->flags & CLIENT_MULTI && c->cmd->flags & CMD_NO_MULTI) {
         rejectCommandFormat(c,"Command not allowed inside a transaction");
         return C_OK;
     }
 
+    // 用户访问权限模块
     /* Check if the user can run this command according to the current
      * ACLs. */
     int acl_errpos;
@@ -4099,6 +4105,7 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    // 集群模块
     /* If cluster is enabled perform the cluster redirection here.
      * However we don't perform the redirection if:
      * 1) The sender of this command is our master.
@@ -4128,6 +4135,7 @@ int processCommand(client *c) {
      * before key eviction, after the last command was executed and consumed
      * some client output buffer memory. */
     evictClients();
+    // 连接管理模块
     if (server.current_client == NULL) {
         /* If we evicted ourself then abort processing the command */
         return C_ERR;
@@ -4200,6 +4208,7 @@ int processCommand(client *c) {
     /* Don't accept write commands if there are not enough good slaves and
      * user configured the min-slaves-to-write option. */
     if (is_write_command && !checkGoodReplicasStatus()) {
+        // 集群相关功能
         rejectCommand(c, shared.noreplicaserr);
         return C_OK;
     }
@@ -4309,6 +4318,7 @@ int processCommand(client *c) {
     } else {
         int flags = CMD_CALL_FULL;
         if (client_reprocessing_command) flags |= CMD_CALL_REPROCESSING;
+        // 执行Redis命令
         call(c,flags);
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand())
             handleClientsBlockedOnKeys();
@@ -7488,6 +7498,7 @@ int main(int argc, char **argv) {
     redisSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
+    // 主线程的事件循环
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;

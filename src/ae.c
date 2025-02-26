@@ -141,6 +141,16 @@ void aeStop(aeEventLoop *eventLoop) {
     eventLoop->stop = 1;
 }
 
+/**
+ * 传输层注册 = 事件源和事件
+ * 应用层注册 = 事件处理函数
+ * @param eventLoop
+ * @param fd
+ * @param mask
+ * @param proc
+ * @param clientData
+ * @return
+ */
 int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         aeFileProc *proc, void *clientData)
 {
@@ -166,6 +176,7 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
 
     aeFileEvent *fe = &eventLoop->events[fd];
 
+    // 幂等?
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
         return AE_ERR;
     fe->mask |= mask;
@@ -436,6 +447,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
             }
 
+            // 处理网络IO读事件
             /* Fire the writable event. */
             if (fe->mask & mask & AE_WRITABLE) {
                 if (!fired || fe->wfileProc != fe->rfileProc) {
@@ -488,6 +500,10 @@ int aeWait(int fd, int mask, long long milliseconds) {
     }
 }
 
+/**
+ * IO thread main
+ * @param eventLoop
+ */
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {

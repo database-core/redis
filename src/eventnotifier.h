@@ -15,6 +15,11 @@
 #define EN_OK 0
 #define EN_ERR -1
 
+/**
+ * 线程事件通信。事件池。
+ * 每个IO线程线程两个事件池
+ * 池size = 1. 因为事件语义相同.
+ */
 typedef struct eventNotifier {
 #ifdef HAVE_EVENT_FD
     int efd;

@@ -81,6 +81,15 @@ static connection *connCreateAcceptedSocket(struct aeEventLoop *el, int fd, void
     return conn;
 }
 
+/**
+ * 创建网络连接后注册网络事件源(socket)
+ * @param conn
+ * @param addr
+ * @param port
+ * @param src_addr
+ * @param connect_handler
+ * @return
+ */
 static int connSocketConnect(connection *conn, const char *addr, int port, const char *src_addr,
         ConnectionCallbackFunc connect_handler) {
     int fd = anetTcpNonBlockBestEffortBindConnect(NULL,addr,port,src_addr);
@@ -94,6 +103,8 @@ static int connSocketConnect(connection *conn, const char *addr, int port, const
     conn->state = CONN_STATE_CONNECTING;
 
     conn->conn_handler = connect_handler;
+    // 网络事件的应用层IO的回调函数
+    // Main函数注册新的网络事件源(socket)
     aeCreateFileEvent(conn->el, conn->fd, AE_WRITABLE,
             conn->type->ae_handler, conn);
 
@@ -185,6 +196,7 @@ static int connSocketAccept(connection *conn, ConnectionCallbackFunc accept_hand
     conn->state = CONN_STATE_CONNECTED;
 
     connIncrRefs(conn);
+    // 连接处理函数
     if (!callHandler(conn, accept_handler)) ret = C_ERR;
     connDecrRefs(conn);
 
@@ -243,6 +255,13 @@ static const char *connSocketGetLastError(connection *conn) {
     return strerror(conn->last_errno);
 }
 
+/**
+ * socket io事件调度
+ * @param el
+ * @param fd
+ * @param clientData 读时，是socket fd; 写时，是应用层写缓冲区
+ * @param mask
+ */
 static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask)
 {
     UNUSED(el);
@@ -282,6 +301,7 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     int call_write = (mask & AE_WRITABLE) && conn->write_handler;
     int call_read = (mask & AE_READABLE) && conn->read_handler;
 
+    // 应用层的IO处理 | 时间分发
     /* Handle normal I/O flows */
     if (!invert && call_read) {
         if (!callHandler(conn, conn->read_handler)) return;
@@ -297,6 +317,9 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     }
 }
 
+/*
+ * 新连接处理器
+ */
 static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
     int max = server.max_new_conns_per_cycle;

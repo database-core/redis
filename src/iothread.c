@@ -287,6 +287,7 @@ void resumeAllIOThreads(void) {
     resumeIOThreadsRange(1, server.io_threads_num-1);
 }
 
+// Main线程发送事件给IO线程
 /* Add the pending clients to the list of IO threads, and trigger an event to
  * notify io threads to handle. */
 int sendPendingClientsToIOThreads(void) {
@@ -310,6 +311,11 @@ int sendPendingClientsToIOThreads(void) {
 
 extern int ProcessingEventsWhileBlocked;
 
+/**
+ * 主线程处理业务逻辑
+ *
+ * @param t
+ */
 /* The main thread processes the clients from IO threads, these clients may have
  * a complete command to execute or need to be freed. Note that IO threads never
  * free client since this operation access much server data.
@@ -354,6 +360,7 @@ void processClientsFromIOThread(IOThread *t) {
         /* Process the pending command and input buffer. */
         if (!c->read_error && c->io_flags & CLIENT_IO_PENDING_COMMAND) {
             c->flags |= CLIENT_PENDING_COMMAND;
+            // 处理业务请求
             if (processPendingCommandAndInputBuffer(c) == C_ERR) {
                 /* If the client is no longer valid, it must be freed safely. */
                 continue;
@@ -381,6 +388,9 @@ void processClientsFromIOThread(IOThread *t) {
             listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         }
         c->running_tid = c->tid;
+        // 业务写事件分发
+        // client与io静态绑定
+        // 业务逻辑完成后(写buffer)，通知IO线程执行IO写
         listLinkNodeHead(mainThreadPendingClientsToIOThreads[c->tid], node);
         node = NULL;
     }
@@ -445,6 +455,15 @@ void processClientsOfAllIOThreads(void) {
     }
 }
 
+/**
+ * TODO 写IO调度?
+ *
+ * @param ae
+ * @param fd
+ * @param ptr
+ * @param mask
+ */
+
 /* After the main thread processes the clients, it will send the clients back to
  * io threads to handle, and fire an event, the io thread handles the event by
  * this function. If the client is not binded to the event loop, we should bind
@@ -500,6 +519,7 @@ void handleClientsFromMainThread(struct aeEventLoop *ae, int fd, void *ptr, int 
 
         /* If the client has pending replies, write replies to client. */
         if (clientHasPendingReplies(c)) {
+            // 写IO事件注册
             writeToClient(c, 0);
             if (!(c->io_flags & CLIENT_IO_CLOSE_ASAP) && clientHasPendingReplies(c)) {
                 connSetWriteHandler(c->conn, sendReplyToClient);
@@ -509,6 +529,10 @@ void handleClientsFromMainThread(struct aeEventLoop *ae, int fd, void *ptr, int 
     listEmpty(t->processing_clients);
 }
 
+/**
+ * IO线程发送事件给Main线程
+ * @param el
+ */
 void IOThreadBeforeSleep(struct aeEventLoop *el) {
     IOThread *t = el->privdata[0];
 
@@ -564,6 +588,7 @@ void initThreadedIO(void) {
     for (int i = 1; i < server.io_threads_num; i++) {
         IOThread *t = &IOThreads[i];
         t->id = i;
+        // IO线程的eventloop
         t->el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
         t->el->privdata[0] = t;
         t->pending_clients = listCreate();
@@ -580,6 +605,8 @@ void initThreadedIO(void) {
         #endif
         pthread_mutex_init(&t->pending_clients_mutex, attr);
 
+        // IO线程和Main线程通信也是基于事件的 => 抽象事件层
+        // IO线程观测主线程的事件消息
         t->pending_clients_notifier = createEventNotifier();
         if (aeCreateFileEvent(t->el, getReadEventFd(t->pending_clients_notifier),
                               AE_READABLE, handleClientsFromMainThread, t) != AE_OK)
@@ -588,6 +615,7 @@ void initThreadedIO(void) {
             exit(1);
         }
 
+        // IO线程的主流程
         /* Create IO thread */
         if (pthread_create(&t->tid, NULL, IOThreadMain, (void*)t) != 0) {
             serverLog(LL_WARNING, "Fatal: Can't initialize IO thread.");
@@ -595,11 +623,14 @@ void initThreadedIO(void) {
         }
 
         /* For main thread */
+        // 主线程的主流程
         mainThreadPendingClientsToIOThreads[i] = listCreate();
         mainThreadPendingClients[i] = listCreate();
         mainThreadProcessingClients[i] = listCreate();
         pthread_mutex_init(&mainThreadPendingClientsMutexes[i], attr);
         mainThreadPendingClientsNotifiers[i] = createEventNotifier();
+        // server的主poll注册事件
+        // 主线程观测IO线程的消息
         if (aeCreateFileEvent(server.el, getReadEventFd(mainThreadPendingClientsNotifiers[i]),
                               AE_READABLE, handleClientsFromIOThread, t) != AE_OK)
         {
