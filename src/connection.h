@@ -48,7 +48,8 @@ typedef void (*ConnectionCallbackFunc)(struct connection *conn);
  * 传输层
  *      监听 => 连接事件 => 创建连接(回调应用层) => [建立连接 => 保持连接] => 关闭连接(回调应用层) => 删除连接
  *      创建连接 => 发起连接 => 保持连接 => 关闭连接 => 删除连接
- * 应用层: 处理读写事件 + 应用层缓冲到网络层缓冲
+ * 应用层
+ *      处理读写事件 + 应用层缓冲到网络层缓冲 + 状态管理(连接创建和关闭时的状态清理)
  */
 typedef struct ConnectionType {
     /* connection type */
@@ -59,12 +60,7 @@ typedef struct ConnectionType {
     void (*cleanup)(void);
     int (*configure)(void *priv, int reconfigure);
 
-    /** 应用层IO */
     /* ae & accept & listen & error & address handler */
-    void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
-    /** 网络层IO */
-    aeFileProc *accept_handler;
-    int (*listen)(connListener *listener);
 
     /* create/shutdown/close connection */
     connection* (*conn_create)(struct aeEventLoop *el);
@@ -73,14 +69,23 @@ typedef struct ConnectionType {
     void (*close)(struct connection *conn);
 
     /* connect & accept */
+    /** 网络层IO */
+    int (*listen)(connListener *listener);
+    int (*accept)(struct connection *conn, ConnectionCallbackFunc accept_handler);
+    // 注册连接事件回调函数
+    aeFileProc *accept_handler;
     int (*connect)(struct connection *conn, const char *addr, int port, const char *source_addr, ConnectionCallbackFunc connect_handler);
     int (*blocking_connect)(struct connection *conn, const char *addr, int port, long long timeout);
-    int (*accept)(struct connection *conn, ConnectionCallbackFunc accept_handler);
 
     /* 网络层IO */
     int (*write)(struct connection *conn, const void *data, size_t data_len);
     int (*writev)(struct connection *conn, const struct iovec *iov, int iovcnt);
     int (*read)(struct connection *conn, void *buf, size_t buf_len);
+
+    /** 应用层IO回调 */
+    // 注册读写事件回调函数
+    // 读写事件的分发调度函数
+    void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
     int (*set_write_handler)(struct connection *conn, ConnectionCallbackFunc handler, int barrier);
     int (*set_read_handler)(struct connection *conn, ConnectionCallbackFunc handler);
     const char *(*get_last_error)(struct connection *conn);
@@ -89,11 +94,12 @@ typedef struct ConnectionType {
     ssize_t (*sync_readline)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
 
     //////////////////////////////////////////////////////////////////////////////////////////////
-
+     // 网络连接的事件管理
     /* event loop */
     void (*unbind_event_loop)(struct connection *conn);
     int (*rebind_event_loop)(struct connection *conn, aeEventLoop *el);
 
+     // 应用层的数据管理
     /* pending data */
     int (*has_pending_data)(struct aeEventLoop *el);
     int (*process_pending_data)(struct aeEventLoop *el);
