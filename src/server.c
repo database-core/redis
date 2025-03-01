@@ -3672,7 +3672,7 @@ void call(client *c, int flags) {
     prev_err_count = server.stat_total_error_replies;
     updateCachedTime(0);
     elapsedStart(&call_timer);
-    c->cmd->proc(c);
+    c->cmd->proc(c); // 执行命令
     const long duration = elapsedUs(call_timer);
     c->duration = duration;
     dirty = server.dirty-dirty;

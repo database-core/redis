@@ -2098,6 +2098,7 @@ void processInputBuffer(client *c) {
                 break;
             }
 
+            // 处理命令
             /* We are finally ready to execute the command. */
             if (processCommandAndResetClient(c) == C_ERR) {
                 /* If the client is no longer valid, we avoid exiting this
