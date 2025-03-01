@@ -43,6 +43,13 @@ typedef enum {
 
 typedef void (*ConnectionCallbackFunc)(struct connection *conn);
 
+/**
+ * 网络抽象层 = 传输层 + 应用层回调
+ * 传输层
+ *      监听 => 连接事件 => 创建连接(回调应用层) => [建立连接 => 保持连接] => 关闭连接(回调应用层) => 删除连接
+ *      创建连接 => 发起连接 => 保持连接 => 关闭连接 => 删除连接
+ * 应用层: 处理读写事件 + 应用层缓冲到网络层缓冲
+ */
 typedef struct ConnectionType {
     /* connection type */
     const char *(*get_type)(struct connection *conn);
@@ -52,11 +59,11 @@ typedef struct ConnectionType {
     void (*cleanup)(void);
     int (*configure)(void *priv, int reconfigure);
 
+    /** 应用层IO */
     /* ae & accept & listen & error & address handler */
     void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
+    /** 网络层IO */
     aeFileProc *accept_handler;
-    int (*addr)(connection *conn, char *ip, size_t ip_len, int *port, int remote);
-    int (*is_local)(connection *conn);
     int (*listen)(connListener *listener);
 
     /* create/shutdown/close connection */
@@ -70,7 +77,7 @@ typedef struct ConnectionType {
     int (*blocking_connect)(struct connection *conn, const char *addr, int port, long long timeout);
     int (*accept)(struct connection *conn, ConnectionCallbackFunc accept_handler);
 
-    /* IO */
+    /* 网络层IO */
     int (*write)(struct connection *conn, const void *data, size_t data_len);
     int (*writev)(struct connection *conn, const struct iovec *iov, int iovcnt);
     int (*read)(struct connection *conn, void *buf, size_t buf_len);
@@ -80,6 +87,8 @@ typedef struct ConnectionType {
     ssize_t (*sync_write)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
     ssize_t (*sync_read)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
     ssize_t (*sync_readline)(struct connection *conn, char *ptr, ssize_t size, long long timeout);
+
+    //////////////////////////////////////////////////////////////////////////////////////////////
 
     /* event loop */
     void (*unbind_event_loop)(struct connection *conn);
@@ -91,8 +100,15 @@ typedef struct ConnectionType {
 
     /* TLS specified methods */
     sds (*get_peer_cert)(struct connection *conn);
+
+    int (*addr)(connection *conn, char *ip, size_t ip_len, int *port, int remote);
+    int (*is_local)(connection *conn);
+
 } ConnectionType;
 
+/**
+ * 抽象socket + 应用层的处理函数
+ */
 struct connection {
     ConnectionType *type;
     ConnectionState state;

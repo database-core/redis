@@ -1255,6 +1255,9 @@ typedef struct {
 } clientReqResInfo;
 #endif
 
+/**
+ * 应用层网络抽象，关注业务本身
+ */
 typedef struct client {
     uint64_t id;            /* Client incremental unique ID. */
     uint64_t flags;         /* Client flags: CLIENT_* macros. */

@@ -318,7 +318,8 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
 }
 
 /*
- * 新连接处理器
+ * 新连接处理器. el是server.el
+ * 事件由Main函数接收
  */
 static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd;
@@ -412,8 +413,8 @@ static ConnectionType CT_Socket = {
     .configure = NULL,
 
     /* ae & accept & listen & error & address handler */
-    .ae_handler = connSocketEventHandler,
-    .accept_handler = connSocketAcceptHandler,
+    .ae_handler = connSocketEventHandler,       // 应用层 + 读写事件
+    .accept_handler = connSocketAcceptHandler,  // 传输层 + 连接事件
     .addr = connSocketAddr,
     .is_local = connSocketIsLocal,
     .listen = connSocketListen,

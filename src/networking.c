@@ -1329,6 +1329,10 @@ int clientHasPendingReplies(client *c) {
     return _clientHasPendingRepliesNonSlave(c);
 }
 
+/**
+ * 连接回调函数: 应用层与网络层的协同
+ * @param conn
+ */
 void clientAcceptHandler(connection *conn) {
     client *c = connGetPrivateData(conn);
 
@@ -1434,6 +1438,7 @@ void acceptCommonHandler(connection *conn, int flags, char *ip) {
         return;
     }
 
+    // 连接事件时，创建网络连接和应用client + 注册应用层事件
     /* Create connection and client */
     if ((c = createClient(conn)) == NULL) {
         char addr[NET_ADDR_STR_LEN] = {0};
