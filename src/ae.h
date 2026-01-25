@@ -94,8 +94,8 @@ typedef struct aeTimeEvent {
 
 /* A fired event */
 typedef struct aeFiredEvent {
-    int fd;
-    int mask;
+    int fd;   // 事件源
+    int mask; // 事件集(可读或者可写)
 } aeFiredEvent;
 
 /**

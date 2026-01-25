@@ -866,8 +866,10 @@ typedef struct client {
                                replication stream that we are receiving from
                                the master. */
     size_t querybuf_peak;   /* Recent (100ms or more) peak of querybuf size. */
+
     int argc;               /* Num of arguments of current command. */
     robj **argv;            /* Arguments of current command. */
+
     int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
     size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */

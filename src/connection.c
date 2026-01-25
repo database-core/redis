@@ -242,6 +242,7 @@ static int connSocketSetReadHandler(connection *conn, ConnectionCallbackFunc fun
     if (!conn->read_handler)
         aeDeleteFileEvent(server.el,conn->fd,AE_READABLE);
     else
+        // 注册读事件和读事件的回调函数
         if (aeCreateFileEvent(server.el,conn->fd,
                     AE_READABLE,conn->type->ae_handler,conn) == AE_ERR) return C_ERR;
     return C_OK;

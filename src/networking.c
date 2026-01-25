@@ -124,6 +124,7 @@ client *createClient(connection *conn) {
         connEnableTcpNoDelay(conn);
         if (server.tcpkeepalive)
             connKeepAlive(conn,server.tcpkeepalive);
+
         // 创建client时，注册业务事件的回调函数
         // 网络事件(acceptable, readable, writable ) + 应用事件(in + out)
         connSetReadHandler(conn, readQueryFromClient);
@@ -1092,6 +1093,7 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
 
 /**
  * 接受连接并且添加到事件池
+ *
  * @param el
  * @param fd
  * @param privdata
@@ -1703,9 +1705,10 @@ void unprotectClient(client *c) {
 int processInlineBuffer(client *c) {
     char *newline;
     int argc, j, linefeed_chars = 1;
+
+    // 手写的编码: 每个命令是一行
     sds *argv, aux;
     size_t querylen;
-
     /* Search for end of line */
     newline = strchr(c->querybuf+c->qb_pos,'\n');
 
@@ -1726,6 +1729,7 @@ int processInlineBuffer(client *c) {
     querylen = newline-(c->querybuf+c->qb_pos);
     aux = sdsnewlen(c->querybuf+c->qb_pos,querylen);
     argv = sdssplitargs(aux,&argc);
+
     sdsfree(aux);
     if (argv == NULL) {
         addReplyError(c,"Protocol error: unbalanced quotes in request");
@@ -1753,6 +1757,7 @@ int processInlineBuffer(client *c) {
         return C_ERR;
     }
 
+    // querybuf被消费后 移动位置
     /* Move querybuffer position to the next query in the buffer. */
     c->qb_pos += querylen+linefeed_chars;
 
@@ -2066,6 +2071,7 @@ void processInputBuffer(client *c) {
             }
         }
 
+        // 命令解码
         if (c->reqtype == PROTO_REQ_INLINE) {
             if (processInlineBuffer(c) != C_OK) break;
             /* If the Gopher mode and we got zero or one argument, process
@@ -2098,7 +2104,7 @@ void processInputBuffer(client *c) {
                 break;
             }
 
-            // 处理命令
+            // 命令执行
             /* We are finally ready to execute the command. */
             if (processCommandAndResetClient(c) == C_ERR) {
                 /* If the client is no longer valid, we avoid exiting this
@@ -2148,6 +2154,8 @@ void readQueryFromClient(connection *conn) {
     qblen = sdslen(c->querybuf);
     if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
     c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+
+    // sock buffer => query buffer
     nread = connRead(c->conn, c->querybuf+qblen, readlen);
     if (nread == -1) {
         if (connGetState(conn) == CONN_STATE_CONNECTED) {
@@ -2184,6 +2192,7 @@ void readQueryFromClient(connection *conn) {
         return;
     }
 
+    // query buffer => 业务逻辑(命令解码 + 命令执行)
     /* There is more data in the client input buffer, continue parsing it
      * in case to check if there is a full command to execute. */
      processInputBuffer(c);
@@ -3425,6 +3434,11 @@ void *IOThreadMain(void *myid) {
 
         serverAssert(getIOPendingCount(id) != 0);
 
+        // 本质是一个流水线架构
+            // setIOPendingCount(id, 0) 来做状态通信
+            // 只支持一级流水线、且只有IO阶段可以并行
+            // 一级流水线，只有串行执行...
+            // 一条流水线中处理的是相同的事件, 因此io_threads_op是全局变量
         // 从存储区读请求并执行IO
         /* Process: note that the main thread will never touch our list
          * before we drop the pending count to 0. */
